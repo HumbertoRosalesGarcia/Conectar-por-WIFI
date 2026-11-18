@@ -1,0 +1,4269 @@
+﻿import os
+import sys
+import socket
+import struct
+import subprocess
+import concurrent.futures
+import asyncio
+import threading
+import queue
+import urllib.request
+import urllib.parse
+import re
+import time
+import json
+import ctypes
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog, simpledialog
+import string
+import random
+import qrcode
+from PIL import Image, ImageTk
+from zeroconf import Zeroconf, ServiceBrowser
+try:
+    import windnd
+except ImportError:
+    windnd = None
+
+# ==============================================================================
+# CONSTANTES Y BASE DE DATOS LOCAL DE DISPOSITIVOS CONOCIDOS / ESTÁTICOS
+# ==============================================================================
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_LOCAL_KNOWN_DEVICES = os.path.join(_SCRIPT_DIR, "known_devices.json")
+if os.path.exists(_LOCAL_KNOWN_DEVICES):
+    KNOWN_DEVICES_FILE = _LOCAL_KNOWN_DEVICES
+else:
+    KNOWN_DEVICES_FILE = r"C:\Users\Administrador\AppData\Local\Programs\known_devices.json"
+SCRCPY_EXE = r"C:\scrcpy\scrcpy.exe"
+
+# Prefijos OUI conocidos para resolución instantánea sin peticiones HTTP externas
+KNOWN_OUIS = {
+    "CC:4B:73": "PAX Terminal",
+    "C0:84:7D": "PAX Terminal",
+    "70:3E:97": "PAX Terminal",
+    "DC:2E:97": "LANDI POS",
+    "B2:9E:85": "Samsung Tablet",
+    "86:E1:DA": "Samsung Tablet",
+    "F4:02:23": "Android Device",
+    "DC:4F:22": "Espressif Inc.",
+    "24:62:AB": "Espressif Inc.",
+    "40:F5:20": "Espressif Inc.",
+    "9C:9C:1F": "Espressif Inc.",
+    "F4:CF:A2": "Espressif Inc.",
+    "2C:F4:32": "Espressif Inc.",
+    "E0:98:06": "Espressif Inc.",
+    "08:33:ED": "Router Wi-Fi",
+    "44:48:B9": "Router Wi-Fi",
+    "B4:B0:24": "TP-Link",
+    "E4:C3:2A": "TP-Link",
+    "B0:2A:43": "Google Home / Cast",
+    "D4:F5:47": "Google Device",
+    "68:50:8C": "Sunmi POS",
+    "CC:8C:BF": "Tuya Smart",
+    "9C:AE:D3": "Epson Printer",
+    "40:2F:86": "LG Electronics",
+    "B8:8C:29": "Midea AC",
+}
+
+MAC_VENDOR_CACHE = {}
+
+def load_known_devices():
+    if os.path.exists(KNOWN_DEVICES_FILE):
+        try:
+            with open(KNOWN_DEVICES_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                for ip, info in data.items():
+                    mac = info.get("mac", "")
+                    name = info.get("name", "")
+                    if mac and name and mac != "Local":
+                        MAC_VENDOR_CACHE[mac.upper()] = name
+                return data
+        except Exception:
+            pass
+    return {}
+
+def save_known_device(ip, name="", mac="", is_static=False, last_port="", network=""):
+    data = load_known_devices()
+    existing = data.get(ip, {})
+    existing["name"] = name or existing.get("name", "")
+    existing["mac"] = mac or existing.get("mac", "")
+    if is_static or existing.get("is_static", False):
+        existing["is_static"] = True
+    if last_port:
+        existing["last_port"] = last_port
+    if network:
+        existing["network"] = network
+    elif "network" not in existing:
+        if ip in ("192.168.1.38", "192.168.1.39", "192.168.1.78", "192.168.1.200", "192.168.1.201", "192.168.1.211"):
+            existing["network"] = "Sitio de Trabajo"
+        else:
+            existing["network"] = "Casa (Familia Rosales Martinez)"
+    data[ip] = existing
+    try:
+        with open(KNOWN_DEVICES_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+# ==============================================================================
+# RESOLUCIÓN HARDWARE ARP NATIVA (WINDOWS SendARP)
+# ==============================================================================
+
+send_arp_fn = ctypes.windll.iphlpapi.SendARP
+
+_CACHED_WIFI_IP = ""
+_LAST_WIFI_IP_CHECK = 0.0
+
+def is_valid_lan_ipv4(ip_str):
+    """Valida que la IP pertenezca a una red LAN real (descarta loopback, APIPA, Tailscale CGNAT y gadget paxusb)."""
+    if not ip_str or not re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", str(ip_str).strip()):
+        return False
+    parts = [int(x) for x in str(ip_str).strip().split(".")]
+    if any(p > 255 for p in parts):
+        return False
+    a, b, c, d = parts
+    if a == 127 or a == 0:
+        return False
+    if a == 169 and b == 254:
+        return False
+    # Ignorar rango CGNAT / Tailscale (100.64.0.0/10) y red USB gadget de PAX (192.168.44.x)
+    if a == 100 and 64 <= b <= 127:
+        return False
+    if a == 192 and b == 168 and c == 44:
+        return False
+    return (a == 192 and b == 168) or (a == 10) or (a == 172 and 16 <= b <= 31)
+
+def get_wifi_adapter_ip(force=False):
+    """Detecta la IP LAN/Wi-Fi real del PC en cualquier red o subred sin depender de 192.168.1.x."""
+    global _CACHED_WIFI_IP, _LAST_WIFI_IP_CHECK
+    now = time.time()
+    if not force and _CACHED_WIFI_IP and (now - _LAST_WIFI_IP_CHECK < 5.0):
+        return _CACHED_WIFI_IP
+
+    candidates = []
+    # 1. Ruta de salida activa hacia Internet (no emite paquetes UDP reales)
+    for target_probe in ("8.8.8.8", "1.1.1.1"):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect((target_probe, 80))
+            ip = s.getsockname()[0]
+            s.close()
+            if is_valid_lan_ipv4(ip):
+                _CACHED_WIFI_IP = ip
+                _LAST_WIFI_IP_CHECK = now
+                return ip
+        except Exception:
+            pass
+
+    # 2. Interfaces configuradas en Windows (netsh wlan / ipconfig)
+    cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    try:
+        out = subprocess.run(["netsh", "interface", "ip", "show", "addresses"], capture_output=True, text=True, errors="replace", creationflags=cflags, timeout=2).stdout
+        cur_is_wifi = False
+        for line in out.splitlines():
+            low = line.lower()
+            if "wi-fi" in low or "wifi" in low or "wlan" in low or "inal" in low:
+                cur_is_wifi = True
+            elif "configuraci" in low or "configuration" in low:
+                cur_is_wifi = False
+            m_ip = re.search(r"(\d+\.\d+\.\d+\.\d+)", line)
+            if m_ip and ("ip" in low or "direcci" in low) and "dns" not in low and "puerta" not in low and "gateway" not in low and "máscara" not in low and "mask" not in low:
+                cand = m_ip.group(1)
+                if is_valid_lan_ipv4(cand):
+                    if cur_is_wifi:
+                        _CACHED_WIFI_IP = cand
+                        _LAST_WIFI_IP_CHECK = now
+                        return cand
+                    candidates.append(cand)
+    except Exception:
+        pass
+
+    # 3. Hostname IPs locales válidas (evitando .1 de adaptadores virtuales como VirtualBox/VMware)
+    try:
+        for cand in socket.gethostbyname_ex(socket.gethostname())[2]:
+            if is_valid_lan_ipv4(cand) and not cand.endswith(".1"):
+                candidates.append(cand)
+    except Exception:
+        pass
+
+    if candidates:
+        _CACHED_WIFI_IP = candidates[0]
+        _LAST_WIFI_IP_CHECK = now
+        return _CACHED_WIFI_IP
+
+    _LAST_WIFI_IP_CHECK = now
+    return _CACHED_WIFI_IP or "127.0.0.1"
+
+def get_mac_sendarp(ip_str):
+    """Obtiene la dirección MAC Layer-2 consultando primero la tabla ARP en memoria y solo si es necesario con SendARP."""
+    ip_clean = str(ip_str).strip()
+    cache = get_local_arp_cache()
+    if ip_clean in cache:
+        return cache[ip_clean]
+    try:
+        dest = struct.unpack('<I', socket.inet_aton(ip_clean))[0]
+        mac_buf = (ctypes.c_ubyte * 6)()
+        mac_len = ctypes.c_ulong(6)
+        if send_arp_fn(dest, 0, ctypes.byref(mac_buf), ctypes.byref(mac_len)) == 0:
+            return ":".join(f"{b:02X}" for b in mac_buf)
+    except Exception:
+        pass
+    return None
+
+def get_local_arp_cache():
+    """Lee pasivamente la tabla ARP que Windows ya mantiene en memoria. Cero paquetes por el aire."""
+    cache = {}
+    cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    try:
+        res = subprocess.run(["arp", "-a"], capture_output=True, text=True, errors="replace", creationflags=cflags, timeout=1.5)
+        for line in res.stdout.splitlines():
+            m = re.search(r"(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F-]+)", line)
+            if m:
+                ip, mac_raw = m.group(1), m.group(2).replace("-", ":").upper()
+                if not mac_raw.startswith("FF:FF") and not mac_raw.startswith("01:00") and mac_raw != "00:00:00:00:00:00":
+                    cache[ip] = mac_raw
+    except Exception:
+        pass
+    return cache
+
+def fast_subnet_arp_scan(subnet):
+    """Lee caché ARP local; si la red es nueva o tiene pocos equipos en caché, despierta ARP en 0.4s sin saturar."""
+    results = get_local_arp_cache()
+    subnet_prefix = f"{subnet}."
+    existing_in_subnet = [ip for ip in results.keys() if ip.startswith(subnet_prefix)]
+    if subnet and subnet != "127.0.0" and len(existing_in_subnet) < 3:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setblocking(False)
+            for i in range(1, 255):
+                try:
+                    s.sendto(b"", (f"{subnet}.{i}", 9))
+                except Exception:
+                    pass
+            s.close()
+            time.sleep(0.35)
+            results = get_local_arp_cache()
+        except Exception:
+            pass
+    return results
+
+SUBNET_SLICE_SIZE = 64
+def scan_subnet_slice(subnet, slice_idx):
+    """Desactivado en bucle de fondo para no emitir ráfagas broadcast de ARP por Wi-Fi."""
+    return get_local_arp_cache()
+
+# ==============================================================================
+# RESOLUCIÓN DINÁMICA DE TARGET ADB / SCRCPY (TODOS LOS PUERTOS Y PROTOCOLOS)
+# ==============================================================================
+
+
+def get_device_mounted_drive(device_name="", ip_or_serial=""):
+    """Detecta la letra de unidad asignada por AndroidDrive (ej. 'E:', 'G:') para este dispositivo."""
+    try:
+        cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        cmd = ["powershell", "-NoProfile", "-Command",
+               "Get-WmiObject Win32_LogicalDisk | Select DeviceID, VolumeName, FileSystem | ConvertTo-Json -Compress"]
+        p = subprocess.run(cmd, capture_output=True, text=True, creationflags=cflags, timeout=3)
+        out = p.stdout.strip()
+        if out:
+            data = json.loads(out)
+            if isinstance(data, dict):
+                data = [data]
+            name_words = [w for w in re.split(r"[\s\-_]+", str(device_name).lower()) if len(w) >= 3 and w not in ("dispositivo", "android", "samsung", "estatica", "estatico")]
+            for item in data:
+                vol = str(item.get("VolumeName", "")).lower()
+                fs = str(item.get("FileSystem", "")).lower()
+                dev_id = str(item.get("DeviceID", "")).rstrip("\\")
+                if fs == "fuse":
+                    if name_words and any(w in vol for w in name_words):
+                        return dev_id
+                    if ip_or_serial and str(ip_or_serial).lower() in vol:
+                        return dev_id
+            fuse_disks = [str(it.get("DeviceID", "")).rstrip("\\") for it in data if str(it.get("FileSystem", "")).lower() == "fuse"]
+            if fuse_disks:
+                return fuse_disks[0]
+    except Exception:
+        pass
+    return None
+
+def resolve_active_adb_target(serial_or_ip, dev=None):
+    """
+    Determina con precisión absoluta el identificador (-s) que ADB y scrcpy reconocen
+    para este dispositivo en este momento:
+    - Serial USB directo (ej. R52N90AHV9W)
+    - IP:Puerto estándar (ej. 192.168.1.79:5555, 192.168.1.38:5555)
+    - IP:Puerto dinámico Wi-Fi (ej. 192.168.1.78:45249 en Landi C20DS)
+    - Serial mDNS TLS (ej. adb-25B6CCU00340-q0IVTD._adb-tls-connect._tcp)
+    """
+    cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    target_str = str(serial_or_ip or "").strip()
+
+    try:
+        res = subprocess.run(["adb", "devices", "-l"], capture_output=True, text=True, errors="replace", creationflags=cflags, timeout=3)
+    except Exception:
+        return target_str
+
+    active_devices = []
+    for line in res.stdout.splitlines():
+        line = line.strip()
+        if not line or line.startswith("List of"):
+            continue
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] == "device":
+            ep = parts[0]
+            model = ""
+            for p in parts[2:]:
+                if p.startswith("model:"):
+                    model = p.split(":", 1)[1]
+            active_devices.append((ep, model))
+
+    # 0. Si dev es un renglón Wi-Fi explícito, buscar primero si su IP ya está conectada en ADB
+    if dev and not dev.get("is_usb") and dev.get("ip"):
+        wifi_ip = str(dev["ip"]).strip()
+        for ep, _ in active_devices:
+            if ep.startswith(f"{wifi_ip}:"):
+                return ep
+
+    # 1. Coincidencia exacta con el target solicitado
+    for ep, _ in active_devices:
+        if ep == target_str:
+            return ep
+
+    # Extraer IP de búsqueda
+    ip_to_match = ""
+    if dev and dev.get("ip") and not dev.get("is_usb"):
+        ip_to_match = str(dev["ip"]).strip()
+    elif re.search(r"\b(\d+\.\d+\.\d+\.\d+)\b", target_str):
+        ip_to_match = re.search(r"\b(\d+\.\d+\.\d+\.\d+)\b", target_str).group(1)
+
+    # 2. Si tenemos IP, buscar si algún dispositivo activo en ADB coincide con esa IP
+    if ip_to_match:
+        # A) Coincidencia directa IP:puerto
+        for ep, _ in active_devices:
+            if ep.startswith(f"{ip_to_match}:"):
+                return ep
+
+        # B) Coincidencia a través de adb mdns services
+        try:
+            m_res = subprocess.run(["adb", "mdns", "services"], capture_output=True, text=True, errors="replace", creationflags=cflags, timeout=2)
+            for m_line in m_res.stdout.splitlines():
+                m_parts = m_line.split()
+                if len(m_parts) >= 3 and m_parts[-1].startswith(f"{ip_to_match}:"):
+                    svc_name = m_parts[0]
+                    for ep, _ in active_devices:
+                        if ep.startswith(svc_name) or svc_name in ep:
+                            return ep
+        except Exception:
+            pass
+
+    # 3. Coincidencia por modelo reportado en adb
+    dev_model = dev.get("name", "") if dev else ""
+    if dev_model:
+        for ep, model in active_devices:
+            if model and (model.lower() in dev_model.lower() or dev_model.lower() in model.lower()):
+                return ep
+
+    # 4. Coincidencia por serial guardado en el objeto dev
+    if dev and dev.get("serial"):
+        for ep, _ in active_devices:
+            if ep == dev["serial"]:
+                return ep
+
+    return target_str
+
+# ==============================================================================
+# SERVICIO DE MONTAJE DE ALMACENAMIENTO EN "ESTE EQUIPO" (DOKAN / ANDROIDDRIVE)
+# ==============================================================================
+
+def ensure_storage_mount():
+    # Desactivado para evitar alertas modales molestas de AndroidDrive cuando dispositivos reconectan
+    pass
+
+# ==============================================================================
+# DETECCIÓN DE PANTALLAS Y CONTROL REMOTO (SCRCPY EN VENTANA NORMAL)
+# ==============================================================================
+
+def get_device_displays(serial_or_ip, device_name="", dev=None):
+    """Detecta cuántas pantallas tiene el dispositivo (ej. E700 -> [0], E800 -> [0, 1])."""
+    if "e800" in (device_name or "").lower():
+        return [0, 1]
+    resolved_target = resolve_active_adb_target(serial_or_ip, dev=dev)
+    cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    try:
+        res = subprocess.run(["adb", "-s", str(resolved_target), "shell", "dumpsys", "display"],
+                             capture_output=True, text=True, errors="replace", creationflags=cflags, timeout=2)
+        matches = re.findall(r'DisplayDeviceInfo\{[^}]+uniqueId="local:(\d+)"', res.stdout)
+        if matches:
+            displays = sorted(list(set(int(m) for m in matches)))
+            return displays
+        count = len(re.findall(r"DisplayDeviceInfo\{", res.stdout))
+        return list(range(max(1, count)))
+    except Exception:
+        if "e800" in str(serial_or_ip).lower():
+            return [0, 1]
+        return [0]
+
+def ensure_device_internet_stability(target):
+    """
+    Garantiza que el dispositivo Android mantenga su conexión a Internet activa, rápida y estable
+    mientras se proyecta la pantalla por Wi-Fi o USB:
+    1. Desactiva wifi_watchdog_poor_network_test (que erróneamente marca 'Sin Internet' al subir la latencia de Wi-Fi).
+    2. Desactiva wifi_suspend_optimizations_enabled (evita que el Wi-Fi se duerma al apagar pantalla).
+    3. Fija wifi_sleep_policy a 2 (NEVER suspender Wi-Fi al apagar la pantalla).
+    4. Desactiva network_avoid_bad_wifi (evita desconexión automática por congestión momentánea).
+    5. Desactiva auto-switch a datos móviles de Samsung (Intelligent Wi-Fi) por jitter de video scrcpy.
+    """
+    def _bg():
+        cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        cmd_str = (
+            "settings put global wifi_watchdog_poor_network_test_enabled 0; "
+            "settings put global wifi_suspend_optimizations_enabled 0; "
+            "settings put global wifi_sleep_policy 2; "
+            "settings put global network_avoid_bad_wifi 0; "
+            "settings put global sem_wifi_switch_to_better_wifi_enabled 0; "
+            "settings put global wifi_switch_to_mobile_data_super_aggressive_mode_on 0"
+        )
+        try:
+            subprocess.run(["adb", "-s", str(target), "shell", cmd_str],
+                           capture_output=True, text=True, errors="replace", creationflags=cflags, timeout=3)
+        except Exception:
+            pass
+    threading.Thread(target=_bg, daemon=True).start()
+
+def launch_remote_control(serial_or_ip, display_id=0, device_name="", dev=None, turn_screen_off=False):
+    """
+    Lanza una ventana NORMAL de scrcpy (minimizables y maximizables, NO en pantalla completa)
+    con optimizaciones de hardware para Allwinner/Rockchip, preservación de ancho de banda Wi-Fi
+    y sin consolas negras.
+    Compatible con CUALQUIER puerto (5555, dinámico Wi-Fi o TLS mDNS).
+    turn_screen_off: Si es True, apaga la pantalla física del dispositivo manteniendo el control remoto total.
+    """
+    if not os.path.exists(SCRCPY_EXE):
+        messagebox.showerror("Error", f"No se encontró el archivo scrcpy en: {SCRCPY_EXE}")
+        return
+
+    # Resolver el serial exacto activo en ADB para evitar "device not found"
+    resolved_target = resolve_active_adb_target(serial_or_ip, dev=dev)
+
+    # Blindar y estabilizar la conexión a Internet del dispositivo en segundo plano
+    ensure_device_internet_stability(resolved_target)
+
+    name_clean = device_name or (dev.get("name") if dev else "") or str(resolved_target)
+    suffix = " [🕶 Pantalla Física Apagada]" if turn_screen_off else ""
+    if display_id == 0:
+        win_title = f"{name_clean} (Control Remoto){suffix}"
+    else:
+        win_title = f"{name_clean} (Pantalla Cliente {display_id}){suffix}"
+
+    cmd = [SCRCPY_EXE, "-s", str(resolved_target), "--no-audio"]
+    if turn_screen_off:
+        cmd.extend(["--turn-screen-off", "--stay-awake"])
+
+    is_wifi = ":" in str(resolved_target)
+    is_e700 = "e700" in name_clean.lower() or "uranus" in name_clean.lower()
+    is_pax = any(p in name_clean.lower() for p in ["e700", "e800", "a80", "a920", "a930", "aries", "uranus", "paydroid", "pax"])
+
+    if not is_e700 and not is_wifi:
+        try:
+            cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            m_res = subprocess.run(["adb", "-s", str(resolved_target), "shell", "getprop", "ro.product.model"],
+                                   capture_output=True, text=True, errors="replace", creationflags=cflags, timeout=2)
+            model_out = m_res.stdout.lower()
+            if "e700" in model_out:
+                is_e700 = True
+            if any(p in model_out for p in ["e700", "e800", "a80", "a920", "a930", "aries", "uranus", "paydroid", "pax"]):
+                is_pax = True
+        except Exception:
+            pass
+
+    if display_id > 0:
+        # Pantalla secundaria (ej. pantalla cliente PAX E800 / E700)
+        cmd.extend(["--display-id", str(display_id), "-m", "1024", "-b", "2M", "--max-fps", "30", "-p", str(27180 + display_id)])
+    elif is_e700:
+        # Terminal PAX E700: software encoder OMX para estabilidad de PayDroid
+        cmd.extend(["--video-encoder=OMX.google.h264.encoder", "-m", "1024", "-b", "2M", "--max-fps", "25"])
+    elif is_pax:
+        # Terminales PAX (A80, E800, etc.): bitrate moderado para radio Wi-Fi 2.4GHz
+        cmd.extend(["-m", "1024", "-b", "2M", "--max-fps", "25"])
+    elif is_wifi:
+        # Dispositivos Android estándar vía Wi-Fi (Samsung Galaxy, tablets, etc.):
+        # Se fija resolución máx 1024, bitrate 2M y 30 FPS.
+        # Esto reduce el consumo de espectro Wi-Fi en más del 65% respecto a 90/120Hz sin límite,
+        # dejando el canal completamente libre para navegación fluida, descargas y llamadas en el teléfono.
+        cmd.extend(["-m", "1024", "-b", "2M", "--max-fps", "30"])
+    else:
+        # Conexión directa por cable USB: alta tasa de transferencia sin interferencia con la radio Wi-Fi
+        cmd.extend(["-m", "1280", "-b", "6M", "--max-fps", "60"])
+
+    cmd.extend(["--window-title", win_title])
+
+    cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+    def _launch_and_check():
+        try:
+            proc = subprocess.Popen(cmd, creationflags=cflags, stderr=subprocess.PIPE, text=True, errors="replace")
+            try:
+                ret = proc.wait(timeout=2.0)
+                if ret != 0:
+                    err_lines = proc.stderr.read()
+                    err_msg = err_lines.strip().splitlines()[-1] if err_lines.strip() else f"Código de salida: {ret}"
+                    messagebox.showerror("Error en Pantalla", f"No se pudo proyectar la pantalla de {name_clean}:\n{err_msg}")
+            except subprocess.TimeoutExpired:
+                # En ejecución normal. Drenar stderr en segundo plano para evitar bloqueos
+                def _drain(pipe):
+                    try:
+                        while pipe.read(1024):
+                            pass
+                    except Exception:
+                        pass
+                    finally:
+                        try:
+                            pipe.close()
+                        except Exception:
+                            pass
+                threading.Thread(target=_drain, args=(proc.stderr,), daemon=True).start()
+        except Exception as e:
+            messagebox.showerror("Error al Iniciar", f"No se pudo iniciar el control remoto: {e}")
+
+    threading.Thread(target=_launch_and_check, daemon=True).start()
+
+# ==============================================================================
+# DESCUBRIMIENTO AUTOMÁTICO DE DISPOSITIVOS USB Y WI-FI EN TIEMPO REAL
+# ==============================================================================
+
+def get_current_wifi_ssid():
+    cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    try:
+        out = subprocess.run(["netsh", "wlan", "show", "interfaces"], capture_output=True, text=True, errors="replace", creationflags=cflags, timeout=2).stdout
+        m = re.search(r"^\s*SSID\s*:\s*(.+)$", out, re.MULTILINE)
+        if m:
+            return m.group(1).strip()
+    except Exception:
+        pass
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", "(Get-NetConnectionProfile).Name"], capture_output=True, text=True, errors="replace", creationflags=cflags, timeout=2).stdout.strip()
+        if out:
+            return out.splitlines()[0].strip()
+    except Exception:
+        pass
+    return ""
+
+def get_default_gateway_for_subnet(subnet):
+    """Detecta la puerta de enlace real de la subred actual (ej. .1, .254, hotspot, etc.)."""
+    cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    try:
+        out = subprocess.run(["route", "print", "0.0.0.0"], capture_output=True, text=True, errors="replace", creationflags=cflags, timeout=1.5).stdout
+        for line in out.splitlines():
+            m = re.search(rf"0\.0\.0\.0\s+0\.0\.0\.0\s+({re.escape(subnet)}\.\d+)", line)
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
+    return f"{subnet}.1" if subnet and subnet != "127.0.0" else "127.0.0.1"
+
+def get_network_info():
+    local_ip = get_wifi_adapter_ip(force=True)
+    parts = local_ip.split(".")
+    subnet = ".".join(parts[:3]) if len(parts) == 4 else "192.168.1"
+    gateway_ip = get_default_gateway_for_subnet(subnet)
+
+    ssid = get_current_wifi_ssid()
+    if ssid:
+        if "familia" in ssid.lower() or "rosales" in ssid.lower():
+            net_name = "Casa (Familia Rosales Martinez)"
+        elif "trabajo" in ssid.lower() or "pos" in ssid.lower() or "oficina" in ssid.lower() or "<" in ssid or "*_*" in ssid or "-_-" in ssid:
+            net_name = "Sitio de Trabajo"
+        else:
+            net_name = f"Wi-Fi: {ssid}"
+    else:
+        net_name = f"Red Local ({subnet}.0/24)"
+
+    return local_ip, subnet, gateway_ip, net_name
+
+def is_randomized_mac(mac):
+    if not mac or len(mac) < 2:
+        return False
+    return mac[1].upper() in ("2", "6", "A", "E")
+
+def lookup_mac_vendor_fast(mac):
+    """Búsqueda ultra-rápida en caché local y prefijos OUI conocidos sin bloquear con HTTP."""
+    if not mac or mac == "Local":
+        return ""
+    mac_up = mac.upper()
+    if mac_up in MAC_VENDOR_CACHE:
+        return MAC_VENDOR_CACHE[mac_up]
+    oui = mac_up[:8]
+    if oui in KNOWN_OUIS:
+        return KNOWN_OUIS[oui]
+    if is_randomized_mac(mac_up):
+        return "Dispositivo Móvil Wi-Fi (MAC Privada)"
+    return ""
+
+def _async_fetch_vendor(mac, ip, callback=None):
+    """Consulta asíncrona no bloqueante de vendor a api.macvendors.com."""
+    try:
+        url = f"https://api.macvendors.com/{urllib.parse.quote(mac)}"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=1.5) as resp:
+            vendor = resp.read().decode("utf-8", errors="ignore").strip()
+            if vendor:
+                MAC_VENDOR_CACHE[mac.upper()] = vendor
+                save_known_device(ip, name=vendor, mac=mac)
+                if callback:
+                    callback(ip, vendor)
+    except Exception:
+        pass
+
+def enable_tcpip_on_usb_devices():
+    # No ejecutar de forma automática en segundo plano para evitar reiniciar adbd inesperadamente
+    pass
+
+_USB_PORT_PROBE_CACHE = {}
+
+def get_usb_device_net_details(serial, cflags=0):
+    """Consulta rápida (<0.15s) de las IPs reales activas en el dispositivo (wlan0, eth0, etc.) y modelo."""
+    wlan_ip = ""
+    all_ips = []
+    model = ""
+    try:
+        cmd_str = "ip -4 -o addr show; echo __MOD__; getprop ro.product.model; echo __DHCP__; getprop dhcp.wlan0.ipaddress"
+        res = subprocess.run(["adb", "-s", str(serial), "shell", cmd_str],
+                             capture_output=True, text=True, errors="replace", creationflags=cflags, timeout=2.5)
+        out = res.stdout or ""
+        parts_mod = out.split("__MOD__")
+        addr_sec = parts_mod[0]
+        rest = parts_mod[1] if len(parts_mod) > 1 else ""
+        parts_dhcp = rest.split("__DHCP__")
+        mod_val = parts_dhcp[0].strip().splitlines()[0].strip() if parts_dhcp[0].strip() else ""
+        dhcp_val = parts_dhcp[1].strip().splitlines()[0].strip() if len(parts_dhcp) > 1 and parts_dhcp[1].strip() else ""
+        if mod_val:
+            model = mod_val
+
+        wifi_cands = []
+        eth_cands = []
+        other_cands = []
+        for l_iface in addr_sec.splitlines():
+            m_i = re.search(r"^\d+:\s+([^\s:]+)\s+inet\s+(\d+\.\d+\.\d+\.\d+)", l_iface.strip())
+            if not m_i:
+                continue
+            if_name, ip_addr = m_i.group(1).lower(), m_i.group(2)
+            # Ignorar loopback, gadget USB interno PAX (paxusb0), datos celulares o link-local
+            if if_name.startswith(("lo", "paxusb", "rndis", "rmnet", "ccmni", "dummy")):
+                continue
+            if ip_addr.startswith(("127.", "169.254.", "192.168.44.")):
+                continue
+            if if_name.startswith("wlan"):
+                wifi_cands.append(ip_addr)
+            elif if_name.startswith("eth"):
+                eth_cands.append(ip_addr)
+            else:
+                other_cands.append(ip_addr)
+
+        if not wifi_cands and re.match(r"^\d+\.\d+\.\d+\.\d+$", dhcp_val) and not dhcp_val.startswith(("127.", "169.254.", "192.168.44.")):
+            wifi_cands.append(dhcp_val)
+
+        all_ips = wifi_cands + eth_cands + other_cands
+        if all_ips:
+            wlan_ip = all_ips[0]
+    except Exception:
+        pass
+    return {"wlan_ip": wlan_ip, "all_ips": all_ips, "model": model}
+
+def get_usb_device_ssid_and_mac(serial, cflags=0):
+    """Obtiene el SSID Wi-Fi actual al que está conectado el terminal y su MAC wlan0."""
+    ssid = ""
+    mac = ""
+    try:
+        res = subprocess.run(
+            ["adb", "-s", str(serial), "shell", "dumpsys wifi | grep -m1 mWifiInfo; echo __MAC__; cat /sys/class/net/wlan0/address 2>/dev/null"],
+            capture_output=True, text=True, errors="replace", creationflags=cflags, timeout=3.0
+        )
+        out = res.stdout or ""
+        sec = out.split("__MAC__")
+        wifi_sec = sec[0]
+        m_s = re.search(r"SSID:\s*([^,\]]+)", wifi_sec)
+        if m_s:
+            cand_s = m_s.group(1).strip().strip('"')
+            if cand_s and cand_s.lower() not in ("<unknown ssid>", "null", "0x"):
+                ssid = cand_s
+        if len(sec) > 1:
+            m_m = re.search(r"([0-9a-fA-F:]{17})", sec[1])
+            if m_m and m_m.group(1).lower() != "02:00:00:00:00:00":
+                mac = m_m.group(1).upper()
+        if not mac:
+            m_m2 = re.search(r"MAC:\s*([0-9a-fA-F:]{17})", wifi_sec)
+            if m_m2 and m_m2.group(1).lower() != "02:00:00:00:00:00":
+                mac = m_m2.group(1).upper()
+    except Exception:
+        pass
+    return ssid, mac
+
+def apply_safe_wifi_adb_props_async(target, port=5555, cflags=0):
+    """Aplica propiedades seguras nativas y configuración global sin bloquear ni reiniciar adbd."""
+    def _bg():
+        try:
+            subprocess.run(
+                ["adb", "-s", str(target), "shell",
+                 f"setprop persist.pax.adb.tcp.port {port}; setprop persist.adb.tcp.port {port}; "
+                 f"setprop persist.sys.adb.tcp.port {port}; setprop persist.sys.enable.tcpip true"],
+                capture_output=True, text=True, creationflags=cflags, timeout=4
+            )
+        except Exception:
+            pass
+        try:
+            subprocess.run(
+                ["adb", "-s", str(target), "shell",
+                 f"settings put global adb_port {port}; settings put global adb_wifi_enabled 1; settings put global adb_allowed_connection_time 0"],
+                capture_output=True, text=True, creationflags=cflags, timeout=8
+            )
+        except Exception:
+            pass
+    threading.Thread(target=_bg, daemon=True).start()
+
+def prepare_usb_device_for_wifi_adb(serial, cflags=0, port=5555, force_tcpip=False):
+    """Configura persistencia de forma segura y activa el puerto TCP/IP en el terminal USB sin colgar adbd ni abortar por timeout de settings."""
+    # 1. Solo setprop nativo rápido (NUNCA incluir settings put aquí para evitar TimeoutExpired de 3s, ni pax.ctrl.adbd.as.root)
+    try:
+        fast_props = (
+            f"setprop persist.pax.adb.tcp.port {port}; "
+            f"setprop persist.adb.tcp.port {port}; "
+            f"setprop persist.sys.adb.tcp.port {port}; "
+            f"setprop persist.sys.enable.tcpip true"
+        )
+        subprocess.run(["adb", "-s", str(serial), "shell", fast_props], capture_output=True, text=True, creationflags=cflags, timeout=5)
+    except Exception:
+        pass
+
+    # 2. Comprobar si service.adb.tcp.port ya está activo en el puerto deseado
+    need_tcpip = force_tcpip
+    if not need_tcpip:
+        try:
+            cur_p = subprocess.run(["adb", "-s", str(serial), "shell", "getprop service.adb.tcp.port"],
+                                   capture_output=True, text=True, errors="replace", creationflags=cflags, timeout=2.5).stdout.strip()
+            if cur_p != str(port):
+                need_tcpip = True
+        except Exception:
+            need_tcpip = True
+
+    tcpip_ok = not need_tcpip
+    if need_tcpip:
+        for attempt in range(2):
+            try:
+                t_res = subprocess.run(["adb", "-s", str(serial), "tcpip", str(port)],
+                                       capture_output=True, text=True, errors="replace", creationflags=cflags, timeout=6)
+                out_t = (t_res.stdout + t_res.stderr).lower()
+                if "restarting in tcp mode" in out_t or t_res.returncode == 0:
+                    tcpip_ok = True
+                    break
+            except Exception:
+                pass
+            if attempt == 0:
+                try:
+                    subprocess.run(["adb", "reconnect", "offline"], capture_output=True, creationflags=cflags, timeout=2)
+                    time.sleep(1.0)
+                except Exception:
+                    pass
+        if tcpip_ok:
+            time.sleep(2.4)
+
+    # 3. settings put global en segundo plano (tarda 2.3-4s en Android/PayDroid)
+    apply_safe_wifi_adb_props_async(serial, port=port, cflags=cflags)
+    return tcpip_ok
+
+def wake_device_to_pc_route(serial, pc_ip, cflags=0):
+    """Emite ping desde el terminal hacia el PC vía USB para despertar el radio Wi-Fi y poblar la tabla ARP entre bandas 2.4GHz/5GHz."""
+    if not pc_ip or pc_ip == "127.0.0.1":
+        return False, ""
+    try:
+        res = subprocess.run(["adb", "-s", str(serial), "shell", f"ping -c 2 -W 1 {pc_ip}"],
+                             capture_output=True, text=True, errors="replace", creationflags=cflags, timeout=5)
+        out = (res.stdout + res.stderr).strip()
+        ok = (res.returncode == 0) or ("ttl=" in out.lower() and "0 received" not in out.lower() and "100% packet loss" not in out.lower())
+        return ok, out
+    except Exception as e:
+        return False, str(e)
+
+def connect_adb_endpoint_verified(ep, cflags=0, attempts=2):
+    """Conecta ADB al endpoint IP:puerto y verifica handshake real en estado 'device' (no 'offline')."""
+    last_out = ""
+    is_unauth = False
+    for att in range(attempts):
+        try:
+            subprocess.run(["adb", "disconnect", ep], capture_output=True, text=True, creationflags=cflags, timeout=2)
+            time.sleep(0.2)
+        except Exception:
+            pass
+        try:
+            c_res = subprocess.run(["adb", "connect", ep], capture_output=True, text=True, errors="replace", creationflags=cflags, timeout=11)
+            last_out = (c_res.stdout + c_res.stderr).strip()
+        except Exception as e:
+            last_out = str(e)
+
+        # Confirmar estado real durante ~3s
+        saw_offline = False
+        for _ in range(10):
+            time.sleep(0.3)
+            try:
+                devs_out = subprocess.run(["adb", "devices"], capture_output=True, text=True, errors="replace", creationflags=cflags, timeout=2).stdout
+                for line in devs_out.splitlines():
+                    if ep in line:
+                        parts = line.split()
+                        st = parts[1] if len(parts) >= 2 else ""
+                        if st == "device":
+                            return True, last_out, False
+                        elif st == "unauthorized":
+                            return False, "Requiere autorizar la PC en la pantalla del dispositivo.", True
+                        elif st == "offline":
+                            saw_offline = True
+            except Exception:
+                pass
+        if saw_offline:
+            try:
+                subprocess.run(["adb", "disconnect", ep], capture_output=True, creationflags=cflags, timeout=2)
+            except Exception:
+                pass
+        if att == 0:
+            time.sleep(1.0)
+    return False, last_out or f"Sin respuesta ADB en {ep}", is_unauth
+
+def get_usb_connected_devices():
+    """Detecta los dispositivos conectados directamente por cable USB reconocidos por ADB (online, offline o no autorizados)."""
+    usb_devs = []
+    cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    try:
+        res = subprocess.run(["adb", "devices", "-l"], capture_output=True, text=True, errors="replace", creationflags=cflags, timeout=3)
+        active_wifi_eps = set()
+        for l_chk in res.stdout.splitlines():
+            p_chk = l_chk.strip().split()
+            if len(p_chk) >= 2 and p_chk[1] == "device" and ":" in p_chk[0]:
+                active_wifi_eps.add(p_chk[0])
+
+        cur_pc_ip = get_wifi_adapter_ip()
+        cur_subnet = ".".join(cur_pc_ip.split(".")[:3]) if "." in cur_pc_ip else ""
+
+        for line in res.stdout.splitlines():
+            line = line.strip()
+            if not line or line.startswith("List of"):
+                continue
+            parts = line.split()
+            if len(parts) >= 2:
+                serial = parts[0]
+                status = parts[1]
+                if ":" in serial or "_adb-tls" in serial:
+                    continue
+
+                if status not in ("device", "offline", "unauthorized"):
+                    continue
+
+                model = ""
+                for p in parts[2:]:
+                    if p.startswith("model:"):
+                        model = p.split(":", 1)[1]
+
+                if not model and serial == "1340003718":
+                    model = "E700"
+                elif not model and serial.startswith("1070"):
+                    model = "E800"
+
+                # SIEMPRE priorizar la IP real en vivo de wlan0/eth0 para soportar CUALQUIER red Wi-Fi
+                wlan_ip = ""
+                if status == "device":
+                    net_det = get_usb_device_net_details(serial, cflags=cflags)
+                    if net_det.get("wlan_ip"):
+                        wlan_ip = net_det["wlan_ip"]
+                    if net_det.get("model") and not model:
+                        model = net_det["model"]
+
+                # Solo usar referencia estática 192.168.1.204/205 si el USB está offline/no responde y seguimos en 192.168.1.x
+                if not wlan_ip and cur_subnet == "192.168.1":
+                    if serial == "1340003718":
+                        wlan_ip = "192.168.1.205"
+                    elif serial.startswith("1070"):
+                        wlan_ip = "192.168.1.204"
+
+                disp_name = f"PAX {model}" if (model.startswith("E") or model.startswith("A")) else (model or f"Android ({serial})")
+                if "e800" in disp_name.lower():
+                    displays = [0, 1]
+                elif "e700" in disp_name.lower():
+                    displays = [0]
+                elif status == "device":
+                    displays = get_device_displays(serial, device_name=disp_name)
+                else:
+                    displays = [0]
+
+                is_5555_open = False
+                if wlan_ip:
+                    if f"{wlan_ip}:5555" in active_wifi_eps:
+                        is_5555_open = True
+                        _USB_PORT_PROBE_CACHE[wlan_ip] = (time.time(), True)
+                    else:
+                        now_ts = time.time()
+                        cached = _USB_PORT_PROBE_CACHE.get(wlan_ip)
+                        if cached and (now_ts - cached[0] < 30.0):
+                            is_5555_open = cached[1]
+                        else:
+                            is_5555_open = bool(check_tcp_ports_fast(wlan_ip, [5555], timeout=1.0))
+                            _USB_PORT_PROBE_CACHE[wlan_ip] = (now_ts, is_5555_open)
+
+                is_online = (status == "device")
+                is_off = (status == "offline")
+                is_unauth = (status == "unauthorized")
+
+                usb_devs.append({
+                    "key": f"USB:{serial}",
+                    "ip": f"USB (IP: {wlan_ip})" if wlan_ip else f"USB ({serial})",
+                    "wlan_ip": wlan_ip,
+                    "mac": "USB Directo",
+                    "name": disp_name,
+                    "port": "USB",
+                    "serial": serial,
+                    "is_adb_connected": is_online,
+                    "is_offline": is_off,
+                    "is_unauthorized": is_unauth,
+                    "is_port_open": is_5555_open,
+                    "is_local_or_router": False,
+                    "is_static": False,
+                    "is_usb": True,
+                    "displays": displays
+                })
+    except Exception:
+        pass
+    return usb_devs
+
+def get_adb_connected_and_mdns():
+    connected_map = {}
+    mdns_ports = {}
+    cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+    try:
+        res = subprocess.run(["adb", "mdns", "services"], capture_output=True, text=True, errors="replace", creationflags=cflags, timeout=2)
+        for line in res.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and re.match(r"^\d+\.\d+\.\d+\.\d+:\d+$", parts[-1]):
+                ip, port = parts[-1].split(":", 1)
+                mdns_ports[ip] = (port, parts[0])
+    except Exception:
+        pass
+
+    try:
+        res = subprocess.run(["adb", "devices", "-l"], capture_output=True, text=True, errors="replace", creationflags=cflags, timeout=3)
+        for line in res.stdout.splitlines():
+            line = line.strip()
+            if not line or line.startswith("List of"):
+                continue
+            parts = line.split()
+            if len(parts) >= 2 and parts[1] == "offline":
+                continue
+            if len(parts) >= 2 and parts[1] == "device":
+                ep = parts[0]
+                model = ""
+                for p in parts[2:]:
+                    if p.startswith("model:"):
+                        model = p.split(":", 1)[1]
+                if ":" in ep and re.match(r"^\d+\.\d+\.\d+\.\d+:\d+$", ep):
+                    ip, port = ep.split(":", 1)
+                    connected_map[ip] = (port, model, ep)
+                elif "._adb" in ep:
+                    svc_prefix = ep.split(".")[0]
+                    matched_ip = None
+                    for m_ip, (m_port, m_svc) in mdns_ports.items():
+                        if m_svc == svc_prefix:
+                            connected_map[m_ip] = (m_port, model, ep)
+                            matched_ip = m_ip
+                            break
+                    if not matched_ip:
+                        connected_map[ep] = ("", model, ep)
+    except Exception:
+        pass
+
+    return connected_map, mdns_ports
+
+def generate_random_string(length: int = 6) -> str:
+    letters_and_digits = string.ascii_letters + string.digits
+    return ''.join(random.choice(letters_and_digits) for _ in range(length))
+
+def is_pax_5555_device(dev):
+    """
+    Retorna True SOLAMENTE si el dispositivo es PAX E700, PAX E800 o PAX A920Pro.
+    Todos los demás terminales (PAX A80, Landi C20DS, tablets, teléfonos, etc.) retornan False.
+    """
+    if not dev:
+        return False
+    name = str(dev.get("name", "")).lower()
+    model = str(dev.get("model", "")).lower()
+    serial = str(dev.get("serial", "")).lower()
+    key = str(dev.get("key", "")).lower()
+    raw = f"{name} {model} {serial} {key}"
+
+    # E700 (nombre de modelo o código Uranus)
+    if "e700" in raw or "uranus" in raw:
+        return True
+    # E800 (nombre de modelo o código Gemini)
+    if "e800" in raw or "gemini" in raw:
+        return True
+    # A920Pro / A920 Pro
+    if "a920pro" in raw or "a920 pro" in raw or "a920" in raw:
+        return True
+
+    return False
+
+def extract_ip_octets(ip_str):
+    """Extrae los 4 octetos numéricos de una IP IPv4 (o USB con IP) para orden numérico ascendente."""
+    if not ip_str:
+        return (999, 999, 999, 999)
+    m = re.search(r"\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b", str(ip_str))
+    if m:
+        try:
+            return tuple(int(x) for x in m.groups())
+        except ValueError:
+            pass
+    return (999, 999, 999, 999)
+
+def get_device_sort_key(dev):
+    """
+    Criterio de ordenamiento solicitado por el usuario:
+    1. Al principio de la lista: Dispositivos en estado Conectado (ADB o USB) (rank 0).
+       Después: Los demás dispositivos no conectados (rank 1).
+    2. Dentro de cada grupo, orden ascendente conforme a su dirección IP numérica (4 octetos).
+    """
+    is_connected = bool(dev.get("is_adb_connected") or dev.get("is_usb"))
+    conn_rank = 0 if is_connected else 1
+    ip_octets = extract_ip_octets(dev.get("ip"))
+    name_str = str(dev.get("name", "")).lower()
+    dev_key = str(dev.get("key", "")).lower()
+    return (conn_rank, ip_octets, 0 if dev.get("is_usb") else 1, name_str, dev_key)
+
+def check_tcp_ports_fast(ip, ports, timeout=0.8):
+    """Comprobación ultra-rápida no bloqueante de puertos TCP con timeout ajustado y reintento para radios Wi-Fi."""
+    open_list = []
+    for p in ports:
+        if not p:
+            continue
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(timeout)
+                if s.connect_ex((ip, int(p))) == 0:
+                    open_list.append(str(p))
+                elif timeout < 1.0:
+                    time.sleep(0.06)
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s2:
+                        s2.settimeout(timeout)
+                        if s2.connect_ex((ip, int(p))) == 0:
+                            open_list.append(str(p))
+        except Exception:
+            pass
+    return open_list
+
+def scan_live_wifi_devices(status_callback=None):
+    """
+    Escaneo real, completo y de alta fidelidad de la red local:
+    - Identifica dispositivos USB directos y terminales ADB.
+    - Ejecuta barrido Layer-2 nativo SendARP sobre los 254 IPs de la subred (1..254).
+    - Agrupa los equipos según la red a la que pertenecen (Sitio de Trabajo vs Casa vs USB).
+    - Deshabilita el estado conectable para equipos que no están físicamente presentes.
+    """
+    ensure_storage_mount()
+    usb_results = get_usb_connected_devices()
+    for u in usb_results:
+        u["network"] = "USB Directo"
+        u["is_on_current_net"] = True
+    enable_tcpip_on_usb_devices()
+    if not usb_results:
+        usb_results = get_usb_connected_devices()
+        for u in usb_results:
+            u["network"] = "USB Directo"
+            u["is_on_current_net"] = True
+
+    local_ip, subnet, gw, current_net_name = get_network_info()
+    cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    known_db = load_known_devices()
+
+    if status_callback:
+        status_callback(f"Escaneando 254 IPs en {current_net_name} ({subnet}.0/24)...")
+
+    # 1. Escaneo nativo SendARP masivo en paralelo sobre todos los 254 IPs
+    live_arp_macs = fast_subnet_arp_scan(subnet)
+
+    # 2. Conexiones ADB vivas y servicios mDNS
+    connected_map, mdns_ports = get_adb_connected_and_mdns()
+
+    # 3. Conjunto completo de candidatos:
+    # - Todos los que respondieron físicamente a SendARP
+    # - Todos los conocidos en known_devices.json
+    # - Todos los conectados por ADB o detectados por mDNS
+    # - Local y Gateway
+    usb_wlan_ips = set()
+    for u in usb_results:
+        u_wip = u.get("wlan_ip", "")
+        if u_wip:
+            usb_wlan_ips.add(u_wip)
+
+    candidate_ips = set(live_arp_macs.keys())
+    for k_ip in known_db.keys():
+        candidate_ips.add(k_ip)
+    for c_ip in connected_map.keys():
+        candidate_ips.add(c_ip)
+    for m_ip in mdns_ports.keys():
+        candidate_ips.add(m_ip)
+    for u_ip in usb_wlan_ips:
+        candidate_ips.add(u_ip)
+    candidate_ips.add(local_ip)
+    candidate_ips.add(gw)
+
+    all_candidate_ips = sorted(list(candidate_ips), key=lambda x: int(x.split(".")[-1]) if x.replace(".", "").isdigit() else 999)
+
+    # 4. Comprobación paralela de puertos:
+    # - Equipos que respondieron a ARP, conexiones ADB, mDNS o reportados por USB
+    # - Y dispositivos conocidos de la red actual o estáticos que pertenezcan a la subred actual
+    current_net_lower = current_net_name.lower()
+    probe_candidate_ips = set(ip for ip in all_candidate_ips if ip in live_arp_macs or ip in connected_map or ip in mdns_ports or ip in usb_wlan_ips or ip == local_ip)
+    for ip, k_info in known_db.items():
+        if ip.startswith(subnet + "."):
+            k_net = str(k_info.get("network", "")).lower()
+            if ("trabajo" in current_net_lower and "trabajo" in k_net) or ("casa" in current_net_lower and "casa" in k_net) or k_info.get("is_static"):
+                probe_candidate_ips.add(ip)
+    alive_on_net_ips = list(probe_candidate_ips)
+
+    def probe_device_ports(ip):
+        if ip in connected_map:
+            return ip, [connected_map[ip][0]]
+        ports_to_check = [5555, 7888]
+        last_p = known_db.get(ip, {}).get("last_port")
+        if last_p and str(last_p).isdigit() and str(last_p) not in ("5555", "7888"):
+            ports_to_check.append(int(last_p))
+        if ip in mdns_ports:
+            m_p = mdns_ports[ip][0]
+            if str(m_p).isdigit() and int(m_p) not in ports_to_check:
+                ports_to_check.append(int(m_p))
+        return ip, check_tcp_ports_fast(ip, ports_to_check)
+
+    port_results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=30) as ex:
+        for ip, open_p in ex.map(probe_device_ports, alive_on_net_ips):
+            if open_p:
+                port_results[ip] = open_p
+
+    results = list(usb_results)
+    for ip in all_candidate_ips:
+        # Permitir siempre equipos conectados por ADB, detectados por mDNS o reportados por un USB conectado (aunque estén en otra subred o VPN)
+        if not ip.startswith(subnet + ".") and ip not in connected_map and ip not in mdns_ports and ip not in usb_wlan_ips:
+            continue
+        is_on_current_net = (ip in live_arp_macs) or (ip in connected_map) or (ip in mdns_ports) or (ip in port_results) or (ip in usb_wlan_ips) or (ip == local_ip)
+        if not is_on_current_net:
+            continue
+        mac = live_arp_macs.get(ip) or known_db.get(ip, {}).get("mac", "")
+        if ip == local_ip:
+            mac = "Local"
+        conn_info = connected_map.get(ip)
+        mdns_info = mdns_ports.get(ip)
+        known_info = known_db.get(ip, {})
+        open_p = port_results.get(ip, [])
+
+        # Asignación de red del dispositivo: los equipos activos en Wi-Fi pertenecen a la red actual
+        dev_network = current_net_name
+
+        detected_port = ""
+        is_adb_connected = False
+        is_port_open = False
+
+        if is_on_current_net:
+            if conn_info:
+                detected_port = conn_info[0]
+                is_adb_connected = True
+                is_port_open = True
+            elif open_p:
+                detected_port = str(open_p[0])
+                is_port_open = True
+            elif mdns_info:
+                detected_port = str(mdns_info[0])
+                is_port_open = True
+        else:
+            # Si no está en esta red, no tiene puertos abiertos en esta ubicación
+            detected_port = known_info.get("last_port", "")
+            is_adb_connected = False
+            is_port_open = False
+
+        name = ""
+        if conn_info and len(conn_info) >= 2 and conn_info[1]:
+            name = conn_info[1]
+        elif known_info.get("name"):
+            name = known_info["name"]
+        elif mdns_info and mdns_info[1]:
+            name = f"Android ({mdns_info[1]})"
+
+        if not name:
+            if ip == local_ip:
+                name = f"{socket.gethostname()} (Este PC)"
+            elif ip == gw:
+                vendor = lookup_mac_vendor_fast(mac)
+                name = f"Router Wi-Fi ({vendor})" if vendor else "Router Wi-Fi (Puerta de enlace)"
+            else:
+                vendor = lookup_mac_vendor_fast(mac)
+                name = vendor if vendor else "Dispositivo en Red Wi-Fi"
+        else:
+            if ip == local_ip and "(Este PC)" not in name:
+                name = f"{name} (Este PC)"
+
+        if name in ("E800", "E700", "A80") or (name.startswith("E") and len(name) == 4 and name[1:].isdigit()):
+            if not name.startswith("PAX "):
+                name = f"PAX {name}"
+
+        is_static = known_info.get("is_static", False)
+
+        # Si no tiene MAC viva, no tiene puertos, no está en ADB y no es estático ni local, omitir
+        if not is_adb_connected and not is_port_open and not mac and not is_static and ip != local_ip:
+            continue
+
+        save_known_device(ip, name=name, mac=mac, is_static=is_static, last_port=detected_port, network=dev_network)
+
+        displays = [0, 1] if "e800" in (name or "").lower() else [0]
+        if is_adb_connected and "e800" not in (name or "").lower():
+            target_str = conn_info[2] if (conn_info and len(conn_info) >= 3 and conn_info[2]) else f"{ip}:{detected_port}"
+            displays = get_device_displays(target_str, device_name=name)
+
+        active_serial = ""
+        if conn_info and len(conn_info) >= 3 and conn_info[2]:
+            active_serial = conn_info[2]
+        elif detected_port:
+            active_serial = f"{ip}:{detected_port}"
+        else:
+            active_serial = ip
+
+        results.append({
+            "key": ip,
+            "ip": ip,
+            "mac": mac,
+            "name": name,
+            "port": detected_port,
+            "serial": active_serial,
+            "is_adb_connected": is_adb_connected,
+            "is_port_open": is_port_open,
+            "is_local_or_router": (ip == local_ip or ip == gw),
+            "is_static": is_static,
+            "is_usb": False,
+            "displays": displays,
+            "network": dev_network,
+            "is_on_current_net": is_on_current_net
+        })
+
+    return local_ip, subnet, results, current_net_name
+
+def connect_ip_automatically(ip, known_port="", status_callback=None):
+    """Conecta una IP por ADB probando puertos abiertos con tiempo de espera adecuado para el handshake."""
+    cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    ports_to_try = []
+    if known_port and str(known_port) not in ("USB", "", "None"):
+        ports_to_try.append(str(known_port))
+    for p in ("5555", "7888", "5556"):
+        if p not in ports_to_try:
+            ports_to_try.append(p)
+
+    open_ports = check_tcp_ports_fast(ip, ports_to_try, timeout=1.2)
+    if not open_ports:
+        # Fallback a descubrimiento mDNS para Android 11+ (puerto dinámico TLS como Landi o teléfonos)
+        try:
+            _, mdns_ports = get_adb_connected_and_mdns()
+            if ip in mdns_ports:
+                open_ports = [mdns_ports[ip][0]]
+        except Exception:
+            pass
+
+    # Fallback inteligente USB: si TCP no respondió y el equipo USB coincide con esta IP o nombre en tabla
+    if not open_ports:
+        try:
+            known_entry = load_known_devices().get(ip, {})
+            known_name_low = str(known_entry.get("name", "")).lower()
+            usb_devs = get_usb_connected_devices()
+            matching_usb = None
+            for u in usb_devs:
+                if not u.get("is_adb_connected"):
+                    continue
+                u_wlan = u.get("wlan_ip", "")
+                u_name = str(u.get("name", "")).lower()
+                if ip == u_wlan or ip in str(u.get("ip", "")):
+                    matching_usb = u
+                    break
+                if known_name_low and (("e700" in known_name_low and "e700" in u_name) or ("e800" in known_name_low and "e800" in u_name) or ("a80" in known_name_low and "a80" in u_name)):
+                    matching_usb = u
+                    break
+            if matching_usb:
+                u_serial = matching_usb["serial"]
+                if status_callback:
+                    status_callback(f"Dispositivo USB detectado ({u_serial}). Activando Wi-Fi (5555)...")
+                pc_ip_now = get_wifi_adapter_ip(force=True)
+                wake_device_to_pc_route(u_serial, pc_ip_now, cflags=cflags)
+                net_det = get_usb_device_net_details(u_serial, cflags=cflags)
+                if net_det.get("wlan_ip"):
+                    ip = net_det["wlan_ip"]
+                prepare_usb_device_for_wifi_adb(u_serial, cflags=cflags, port=5555)
+                wake_device_to_pc_route(u_serial, pc_ip_now, cflags=cflags)
+                open_ports = ["5555"]
+        except Exception:
+            pass
+
+    # Si TCP no respondió aún pero se tiene un puerto configurado o es IP privada LAN, intentar puerto 5555 directo
+    if not open_ports and known_port and str(known_port) not in ("USB", "", "None"):
+        open_ports = [str(known_port)]
+    elif not open_ports and is_valid_lan_ipv4(ip):
+        open_ports = ["5555"]
+
+    if not open_ports:
+        return (
+            False,
+            "El dispositivo tiene los puertos ADB cerrados (activa 'Depuración por Wi-Fi' o puerto 5555).",
+            ""
+        )
+
+    last_err = ""
+    for port in open_ports:
+        ep = f"{ip}:{port}"
+        if status_callback:
+            status_callback(f"Conectando ADB a {ep}...")
+        try:
+            is_online, out, is_unauthorized = connect_adb_endpoint_verified(ep, cflags=cflags, attempts=2)
+            if is_unauthorized:
+                last_err = out
+
+            if is_online:
+                save_known_device(ip, last_port=port)
+                model = ""
+                try:
+                    m_res = subprocess.run(["adb", "-s", ep, "shell", "getprop", "ro.product.model"], capture_output=True, text=True, creationflags=cflags, timeout=2)
+                    model = m_res.stdout.strip()
+                    apply_safe_wifi_adb_props_async(ep, port=port, cflags=cflags)
+                    ensure_device_internet_stability(ep)
+                except Exception:
+                    pass
+                return True, ep, model
+            elif is_unauthorized:
+                return False, last_err, ""
+            else:
+                last_err = out or f"El dispositivo en {ep} no completó el inicio de sesión ADB (estado offline)."
+                if "failed to connect" in last_err.lower() and str(port) != "5555":
+                    last_err = (
+                        f"Fallo al conectar a {ep}.\n\n"
+                        f"En dispositivos con Android 11+ (como este terminal) debes VINCULARLO primero:\n"
+                        f"1. Toca 'Puerto' en el bot y entra en la pestaña 'Vincular Dispositivo (Pairing)'.\n"
+                        f"2. En el dispositivo toca 'Vincular dispositivo con un código de vinculación'.\n"
+                        f"3. Escribe el código de 6 dígitos y el puerto de vinculación para autorizar la PC."
+                    )
+                # Purgar socket inmediatamente para evitar dejar dispositivos zombis en estado 'offline'
+                subprocess.run(["adb", "disconnect", ep], capture_output=True, text=True, creationflags=cflags, timeout=2)
+                return False, last_err, ""
+        except Exception as e:
+            last_err = str(e)
+
+    return False, last_err or "No se pudo establecer sesión ADB.", ""
+
+# ==============================================================================
+# INTERFAZ GRÁFICA (GUI) CON MONITOR DE TIEMPO REAL Y CONTROL REMOTO
+# ==============================================================================
+
+class RealTimeMultiADBApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Administrador de Dispositivos Wi-Fi y USB (Organizado por Red)")
+        self.root.geometry("1260x660")
+        self.root.minsize(1040, 500)
+
+        self.scanning = False
+        self.connecting = False
+        self.device_rows = {}
+        self.all_devices_data = []
+        self.missing_counters = {}
+        self.port_fail_count = {}
+        self.connecting_ips = set()
+        self.watcher_slice_idx = 0
+        self._auto_opened_usb_serials = set()
+
+        self.local_ip = "127.0.0.1"
+        self.subnet = "192.168.1"
+        self.gw = "192.168.1.1"
+        self.current_net_name = "Detectando red..."
+
+        self.group_frames = {}
+        self.group_headers = {}
+        self.group_row_containers = {}
+
+        self._stop_watcher = threading.Event()
+        self._watcher_thread = None
+        self.user_disconnected = set()
+        self._last_keepalive_time = 0.0
+        self._last_port_probe_time = 0.0
+
+        self.msg_queue = queue.Queue()
+        self.root.after(50, self._process_queue)
+
+        # Barra superior con título y botón de escaneo manual
+        header = ttk.Frame(root, padding=12)
+        header.pack(fill=tk.X)
+
+        ttk.Label(
+            header,
+            text="Panel de Control de Dispositivos Android (Wi-Fi y USB)",
+            font=("Segoe UI", 13, "bold")
+        ).pack(side=tk.LEFT)
+
+        ttk.Button(
+            header,
+            text="🕶 Ocultar a 2º Plano (Ctrl+Alt+L)",
+            command=self.hide_to_background
+        ).pack(side=tk.RIGHT, padx=5)
+
+        self.btn_scan = ttk.Button(
+            header,
+            text="🔄 Forzar Escaneo Completo",
+            command=self.trigger_scan
+        )
+        self.btn_scan.pack(side=tk.RIGHT, padx=5)
+
+        # Subtítulo de red
+        sub_frame = ttk.Frame(root, padding=(12, 0, 12, 4))
+        sub_frame.pack(fill=tk.X)
+        self.lbl_net_info = ttk.Label(
+            sub_frame,
+            text="Detectando red Wi-Fi y dispositivos...",
+            foreground="#0055aa",
+            font=("Segoe UI", 9, "bold")
+        )
+        self.lbl_net_info.pack(anchor=tk.W)
+
+        # Barra de herramientas: Búsqueda rápida + Filtro de Red + Agregar IP Estática
+        toolbar = ttk.Frame(root, padding=(12, 2, 12, 6))
+        toolbar.pack(fill=tk.X)
+
+        ttk.Label(toolbar, text="🔍 Buscar:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(0, 4))
+        self.filter_var = tk.StringVar()
+        self.filter_var.trace_add("write", self.apply_filter)
+        self.entry_filter = ttk.Entry(toolbar, textvariable=self.filter_var, width=14)
+        self.entry_filter.pack(side=tk.LEFT, padx=(0, 14))
+
+        ttk.Label(toolbar, text="🌐 Ver Red:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(0, 4))
+        self.net_filter_var = tk.StringVar(value="Solo Red Actual Conectada")
+        self.combo_net_filter = ttk.Combobox(
+            toolbar,
+            textvariable=self.net_filter_var,
+            values=["Todas las Redes", "Solo Red Actual Conectada", "Solo Sitio de Trabajo", "Solo Casa"],
+            state="readonly",
+            width=26
+        )
+        self.combo_net_filter.pack(side=tk.LEFT, padx=(0, 14))
+        self.combo_net_filter.bind("<<ComboboxSelected>>", self.apply_filter)
+
+        ttk.Label(toolbar, text="➕ Agregar IP:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(0, 4))
+        self.manual_ip_var = tk.StringVar()
+        self.entry_manual_ip = ttk.Entry(toolbar, textvariable=self.manual_ip_var, width=15)
+        self.entry_manual_ip.pack(side=tk.LEFT, padx=(0, 6))
+        self.entry_manual_ip.bind("<Return>", lambda e: self.add_manual_ip())
+
+        btn_add = ttk.Button(toolbar, text="Agregar", command=self.add_manual_ip)
+        btn_add.pack(side=tk.LEFT)
+
+        btn_qr = ttk.Button(toolbar, text="📷 Vincular con QR", command=self.open_qr_pairing_dialog)
+        btn_qr.pack(side=tk.LEFT, padx=(8, 0))
+
+        self.screen_off_var = tk.BooleanVar(value=False)
+        self.chk_screen_off = ttk.Checkbutton(
+            toolbar,
+            text="🕶 Apagar pantalla física al abrir",
+            variable=self.screen_off_var
+        )
+        self.chk_screen_off.pack(side=tk.LEFT, padx=(12, 0))
+
+        # Encabezados de columna
+        col_header = ttk.Frame(root, padding=(16, 6, 30, 4))
+        col_header.pack(fill=tk.X)
+        ttk.Label(col_header, text="Sel.", width=4, font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT)
+        ttk.Label(col_header, text="Nombre del Dispositivo", width=26, font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=3)
+        ttk.Label(col_header, text="Dirección IP", width=20, font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=3)
+        ttk.Label(col_header, text="Dirección MAC", width=17, font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=3)
+        ttk.Label(col_header, text="Estado / Conexión", width=24, font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=3)
+        ttk.Label(col_header, text="Control Remoto / ADB", width=58, font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=3)
+
+        ttk.Separator(root, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=12)
+
+        # Lista desplazable con soporte de rueda de ratón (MouseWheel)
+        list_container = ttk.Frame(root, padding=(12, 4, 12, 4))
+        list_container.pack(fill=tk.BOTH, expand=True)
+
+        self.canvas = tk.Canvas(list_container, borderwidth=0, highlightthickness=0)
+        self.scrollbar = ttk.Scrollbar(list_container, orient="vertical", command=self.canvas.yview)
+        self.scrollable_frame = ttk.Frame(self.canvas)
+
+        self.scrollable_frame.bind(
+            "<Configure>",
+            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        )
+
+        self.canvas_window = self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfig(self.canvas_window, width=e.width))
+
+        # Botones de acción principal
+        action_frame = ttk.Frame(root, padding=12)
+        action_frame.pack(fill=tk.X)
+
+        ttk.Button(action_frame, text="Seleccionar Disponibles", command=self.select_mobiles).pack(side=tk.LEFT, padx=4)
+        ttk.Button(action_frame, text="Deseleccionar Todos", command=self.deselect_all).pack(side=tk.LEFT, padx=4)
+
+        ttk.Button(action_frame, text="❌ Desconectar Todo ADB", command=self.disconnect_all).pack(side=tk.RIGHT, padx=4)
+        self.btn_connect = ttk.Button(
+            action_frame,
+            text="⚡ Conectar Seleccionados",
+            command=self.connect_selected
+        )
+        self.btn_connect.pack(side=tk.RIGHT, padx=6)
+
+        # Barra de estado
+        self.status_var = tk.StringVar(value="Iniciando escaneo...")
+        status_bar = ttk.Label(root, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W, padding=5)
+        status_bar.pack(fill=tk.X, side=tk.BOTTOM)
+
+        # Cierre limpio y atajos
+        self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
+        self.root.bind("<Control-Alt-l>", lambda e: self.toggle_window_visibility())
+        self.root.bind("<Control-Alt-L>", lambda e: self.toggle_window_visibility())
+        self.root.bind("<Unmap>", self._on_unmap)
+
+        self._hotkey_thread = threading.Thread(target=self._global_hotkey_loop, daemon=True)
+        self._hotkey_thread.start()
+
+        # Iniciar escaneo inicial
+        self.root.after(100, self.trigger_scan)
+
+    def _on_mousewheel(self, event):
+        self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def _on_unmap(self, event):
+        if event.widget == self.root and self.root.state() == "iconic":
+            self.root.after(40, self.root.withdraw)
+
+    def hide_to_background(self):
+        try:
+            self.root.withdraw()
+            self.set_status("Aplicación en segundo plano. Presiona CTRL + ALT + L para volver a abrirla.")
+        except Exception:
+            pass
+
+    def show_from_background(self):
+        try:
+            self.root.deiconify()
+            self.root.state("normal")
+            self.root.attributes("-topmost", True)
+            self.root.update()
+            self.root.attributes("-topmost", False)
+            self.root.lift()
+            self.root.focus_force()
+        except Exception:
+            pass
+
+    def toggle_window_visibility(self):
+        try:
+            if self.root.state() in ("withdrawn", "iconic"):
+                self.show_from_background()
+            else:
+                self.hide_to_background()
+        except Exception:
+            pass
+
+    def _global_hotkey_loop(self):
+        user32 = ctypes.windll.user32
+        VK_CONTROL = 0x11
+        VK_MENU = 0x12
+        VK_L = 0x4C
+        was_pressed = False
+
+        while not self._stop_watcher.is_set():
+            time.sleep(0.04)
+            try:
+                is_ctrl = bool(user32.GetAsyncKeyState(VK_CONTROL) & 0x8000)
+                is_alt = bool(user32.GetAsyncKeyState(VK_MENU) & 0x8000)
+                is_l = bool(user32.GetAsyncKeyState(VK_L) & 0x8000)
+                is_combo = is_ctrl and is_alt and is_l
+                if is_combo and not was_pressed:
+                    was_pressed = True
+                    self.post_gui(self.toggle_window_visibility)
+                elif not is_combo:
+                    was_pressed = False
+            except Exception:
+                pass
+
+    def _on_closing(self):
+        self._stop_watcher.set()
+        self.root.destroy()
+
+    def post_gui(self, fn, *args, **kwargs):
+        self.msg_queue.put((fn, args, kwargs))
+
+    def _process_queue(self):
+        try:
+            while True:
+                fn, args, kwargs = self.msg_queue.get_nowait()
+                try:
+                    fn(*args, **kwargs)
+                except Exception:
+                    pass
+        except queue.Empty:
+            pass
+        if not self._stop_watcher.is_set():
+            self.root.after(40, self._process_queue)
+
+    def set_status(self, text):
+        self.post_gui(self.status_var.set, text)
+
+    def _update_network_subtitle(self):
+        count = len(self.device_rows)
+        self.lbl_net_info.config(
+            text=f"Red Actual: {self.current_net_name} ({self.subnet}.0/24)  |  IP PC: {self.local_ip}  |  Equipos: {count}  |  ⌨ Atajo: CTRL + ALT + L"
+        )
+
+    # ==========================================================================
+    # GESTIÓN DE GRUPOS VISUALES POR RED
+    # ==========================================================================
+
+    def _get_or_create_group_container(self, group_name=None):
+        if not hasattr(self, "rows_container") or not self.rows_container.winfo_exists():
+            self.rows_container = ttk.Frame(self.scrollable_frame)
+            self.rows_container.pack(fill=tk.X, expand=True, pady=1)
+        return self.rows_container, self.rows_container
+
+    # ==========================================================================
+    # ESCANEO INICIAL Y POBLACIÓN DE LA LISTA
+    # ==========================================================================
+
+    def trigger_scan(self):
+        if self.scanning or self.connecting:
+            return
+        self.scanning = True
+        self.btn_scan.config(state=tk.DISABLED)
+        self.set_status("Escaneando 254 IPs de la subred en tiempo real...")
+        threading.Thread(target=self._scan_worker, daemon=True).start()
+
+    def _scan_worker(self):
+        try:
+            local_ip, subnet, devices, net_name = scan_live_wifi_devices(status_callback=self.set_status)
+            self.post_gui(self._populate_devices, local_ip, subnet, devices, net_name)
+        except Exception as e:
+            self.set_status(f"Error durante el escaneo: {e}")
+        finally:
+            self.scanning = False
+            self.post_gui(self.btn_scan.config, state=tk.NORMAL)
+
+    def _populate_devices(self, local_ip, subnet, devices, net_name=None):
+        self.local_ip = local_ip
+        self.subnet = subnet
+        if net_name:
+            self.current_net_name = net_name
+        self.all_devices_data = devices
+
+        for w in self.scrollable_frame.winfo_children():
+            w.destroy()
+        self.device_rows.clear()
+        self.missing_counters.clear()
+        self.port_fail_count.clear()
+        self.group_frames.clear()
+        self.group_headers.clear()
+        self.group_row_containers.clear()
+
+        self.rows_container = ttk.Frame(self.scrollable_frame)
+        self.rows_container.pack(fill=tk.X, expand=True, pady=1)
+
+        sorted_devs = sorted(devices, key=get_device_sort_key)
+
+        for dev in sorted_devs:
+            self._create_row(dev)
+
+        self._update_network_subtitle()
+
+        any_connected = any(d.get("is_adb_connected") or d.get("is_usb") for d in devices)
+        if any_connected:
+            ensure_storage_mount()
+
+        self.apply_filter()
+        self.status_var.set(f"Detección activa: {len(devices)} dispositivos organizados por red.")
+
+        if self._watcher_thread is None or not self._watcher_thread.is_alive():
+            self._watcher_thread = threading.Thread(target=self._auto_watcher_loop, daemon=True)
+            self._watcher_thread.start()
+
+    # ==========================================================================
+    # MONITOR EN TIEMPO REAL (SIN RECONEXIONES AUTOMÁTICAS INVASIVAS)
+    # ==========================================================================
+
+    def _auto_watcher_loop(self):
+        """
+        Hilo en segundo plano continuo (cada 2.5s):
+        - Detecta automáticamente dispositivos que se conecten por USB o Wi-Fi.
+        - Escanea rotativamente porciones de la subred para capturar nuevos dispositivos en Wi-Fi.
+        - Detecta dispositivos que se desconecten físicamente y actualiza su estado.
+        - NUNCA reconecta dispositivos de forma automática si el usuario los desconectó.
+        """
+        cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+        while not self._stop_watcher.is_set():
+            time.sleep(6.0)
+            if self.scanning or self.connecting:
+                continue
+
+            try:
+                now_curr = time.time()
+                # 0. Keep-alive Heartbeat cada 15s para evitar que Android suspenda el Wi-Fi o cierre ADB
+                if now_curr - getattr(self, "_last_keepalive_time", 0) > 60.0:
+                    self._last_keepalive_time = now_curr
+                    for row_k, r_info in list(self.device_rows.items()):
+                        d_obj = r_info.get("dev", {})
+                        ip_item = d_obj.get("ip", "")
+                        if d_obj.get("is_adb_connected") and not d_obj.get("is_usb") and ip_item not in self.user_disconnected:
+                            s_tgt = d_obj.get("serial") or (f"{ip_item}:{d_obj.get('port', '5555')}" if d_obj.get("port") else ip_item)
+                            try:
+                                subprocess.Popen(["adb", "-s", s_tgt, "shell", ":"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=cflags)
+                            except Exception:
+                                pass
+
+                # 0b. Detectar cambio automático de red Wi-Fi / subred cada 12s
+                if now_curr - getattr(self, "_last_net_check_time", 0) > 12.0:
+                    self._last_net_check_time = now_curr
+                    new_ip, new_sub, new_gw, new_net = get_network_info()
+                    if new_sub != self.subnet or new_ip != self.local_ip or new_net != self.current_net_name:
+                        self.local_ip = new_ip
+                        self.subnet = new_sub
+                        self.gw = new_gw
+                        self.current_net_name = new_net
+                        self.post_gui(self._update_network_subtitle)
+                        self.post_gui(self.trigger_scan)
+                        continue
+
+                # 1. Obtener USB actuales
+                usb_results = get_usb_connected_devices()
+
+                live_map = {}
+                usb_wlan_ips = set()
+                for u in usb_results:
+                    u["network"] = "USB Directo"
+                    u["is_on_current_net"] = True
+                    k = u["key"]
+                    live_map[k] = u
+                    if u.get("wlan_ip"):
+                        usb_wlan_ips.add(u["wlan_ip"])
+
+                # 2. Conexiones ADB y puertos MDNS
+                connected_map, mdns_ports = get_adb_connected_and_mdns()
+
+                # 3. Lectura 100% pasiva de la tabla ARP local (Cero paquetes por el aire, cero saturación Wi-Fi)
+                arp_macs = get_local_arp_cache()
+
+                # 4. Candidatos a monitorear
+                known_db = load_known_devices()
+                candidate_ips = set(self.device_rows.keys())
+                for k_ip in known_db.keys():
+                    candidate_ips.add(k_ip)
+                for c_ip in connected_map.keys():
+                    candidate_ips.add(c_ip)
+                for m_ip in mdns_ports.keys():
+                    candidate_ips.add(m_ip)
+                for u_ip in usb_wlan_ips:
+                    candidate_ips.add(u_ip)
+                for a_ip in arp_macs.keys():
+                    candidate_ips.add(a_ip)
+                candidate_ips.add(self.local_ip)
+                candidate_ips.add(self.gw)
+
+                valid_candidate_ips = [
+                    ip for ip in candidate_ips
+                    if re.match(r"^\d+\.\d+\.\d+\.\d+$", ip)
+                    and (ip.startswith(self.subnet + ".") or ip in connected_map or ip in mdns_ports or ip in usb_wlan_ips)
+                ]
+
+                # Sondear puertos TCP solo en equipos no conectados y con cadencia espaciada para no agotar sockets
+                candidate_port_results = {}
+                should_probe_tcp = (now_curr - getattr(self, "_last_port_probe_time", 0) > 30.0)
+                if should_probe_tcp:
+                    self._last_port_probe_time = now_curr
+                    def _probe_ports_safe(ip):
+                        if ip in connected_map:
+                            return ip, [connected_map[ip][0]]
+                        ports = [5555]
+                        last_p = known_db.get(ip, {}).get("last_port")
+                        if last_p and str(last_p).isdigit() and str(last_p) != "5555":
+                            ports.append(int(last_p))
+                        return ip, check_tcp_ports_fast(ip, ports, timeout=0.6)
+
+                    current_net_lower = self.current_net_name.lower()
+                    probe_candidate_ips = set(ip for ip in valid_candidate_ips if (ip in arp_macs or ip in mdns_ports or ip in usb_wlan_ips) and ip not in connected_map)
+                    # Incluir siempre dispositivos estáticos y conocidos en la comprobación
+                    for ip_c in valid_candidate_ips:
+                        if ip_c.startswith(self.subnet + "."):
+                            k_inf = known_db.get(ip_c, {})
+                            if k_inf.get("is_static") or ip_c in self.device_rows:
+                                probe_candidate_ips.add(ip_c)
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+                        for ip, p_list in ex.map(_probe_ports_safe, list(probe_candidate_ips)):
+                            if p_list:
+                                candidate_port_results[ip] = p_list
+                else:
+                    for ip_c in connected_map:
+                        candidate_port_results[ip_c] = [connected_map[ip_c][0]]
+
+                for ip in valid_candidate_ips:
+                    is_on_current_net = (ip in arp_macs) or (ip in connected_map) or (ip in mdns_ports) or (ip in candidate_port_results) or (ip in usb_wlan_ips) or (ip == self.local_ip)
+                    if not is_on_current_net:
+                        continue
+                    mac = arp_macs.get(ip) or known_db.get(ip, {}).get("mac", "")
+                    if ip == self.local_ip:
+                        mac = "Local"
+                    conn_info = connected_map.get(ip)
+                    mdns_info = mdns_ports.get(ip)
+                    known_info = known_db.get(ip, {})
+                    open_p = candidate_port_results.get(ip, [])
+
+                    # Asignación de red del dispositivo: los equipos activos en Wi-Fi pertenecen a la red actual
+                    dev_network = self.current_net_name
+
+                    detected_port = ""
+                    is_adb_connected = False
+                    is_port_open = False
+
+                    if is_on_current_net:
+                        if conn_info:
+                            detected_port = conn_info[0]
+                            is_adb_connected = True
+                            is_port_open = True
+                            self.port_fail_count[ip] = 0
+                        elif open_p:
+                            detected_port = str(open_p[0])
+                            is_port_open = True
+                            self.port_fail_count[ip] = 0
+                        elif mdns_info:
+                            detected_port = str(mdns_info[0])
+                            is_port_open = True
+                            self.port_fail_count[ip] = 0
+                        else:
+                            old_row = self.device_rows.get(ip)
+                            if old_row and old_row["dev"].get("is_port_open"):
+                                fails = self.port_fail_count.get(ip, 0) + 1
+                                self.port_fail_count[ip] = fails
+                                if fails < 4:
+                                    is_port_open = True
+                                    detected_port = old_row["dev"].get("port", "5555")
+                                else:
+                                    is_port_open = False
+                            else:
+                                is_port_open = False
+                    else:
+                        detected_port = known_info.get("last_port", "")
+                        is_adb_connected = False
+                        is_port_open = False
+
+                    name = ""
+                    if conn_info and len(conn_info) >= 2 and conn_info[1]:
+                        name = conn_info[1]
+                    elif known_info.get("name"):
+                        name = known_info["name"]
+                    elif mdns_info and mdns_info[1]:
+                        name = f"Android ({mdns_info[1]})"
+
+                    if not name:
+                        if ip == self.local_ip:
+                            name = f"{socket.gethostname()} (Este PC)"
+                        elif ip == self.gw:
+                            vendor = lookup_mac_vendor_fast(mac)
+                            name = f"Router Wi-Fi ({vendor})" if vendor else "Router Wi-Fi (Puerta de enlace)"
+                        else:
+                            vendor = lookup_mac_vendor_fast(mac)
+                            name = vendor if vendor else "Dispositivo en Red Wi-Fi"
+                    else:
+                        if ip == self.local_ip and "(Este PC)" not in name:
+                            name = f"{name} (Este PC)"
+
+                    if name in ("E800", "E700", "A80") or (name.startswith("E") and len(name) == 4 and name[1:].isdigit()):
+                        if not name.startswith("PAX "):
+                            name = f"PAX {name}"
+
+                    is_static = known_info.get("is_static", False)
+
+                    displays = [0, 1] if "e800" in (name or "").lower() else [0]
+                    if is_adb_connected and "e800" not in (name or "").lower():
+                        target_str = conn_info[2] if (conn_info and len(conn_info) >= 3 and conn_info[2]) else f"{ip}:{detected_port}"
+                        displays = get_device_displays(target_str, device_name=name)
+
+                    is_known = (ip in known_db)
+                    if not is_adb_connected and not is_port_open and not mac and not is_static and not is_known and ip != self.local_ip:
+                        continue
+
+                    active_serial = ""
+                    if conn_info and len(conn_info) >= 3 and conn_info[2]:
+                        active_serial = conn_info[2]
+                    elif detected_port:
+                        active_serial = f"{ip}:{detected_port}"
+                    else:
+                        active_serial = ip
+
+                    dev_item = {
+                        "key": ip,
+                        "ip": ip,
+                        "mac": mac,
+                        "name": name,
+                        "port": detected_port,
+                        "serial": active_serial,
+                        "is_adb_connected": is_adb_connected,
+                        "is_port_open": is_port_open,
+                        "is_local_or_router": (ip == self.local_ip or ip == self.gw),
+                        "is_static": is_static,
+                        "is_known": is_known,
+                        "is_usb": False,
+                        "displays": displays,
+                        "network": dev_network,
+                        "is_on_current_net": is_on_current_net
+                    }
+                    live_map[ip] = dev_item
+
+                # 5. Aplicación diferencial
+                current_keys = set(self.device_rows.keys())
+                live_keys = set(live_map.keys())
+
+                to_add = [live_map[k] for k in (live_keys - current_keys)]
+                for dev in to_add:
+                    self.missing_counters[dev["key"]] = 0
+                    self.post_gui(self._add_device_row, dev)
+
+                to_remove_candidates = current_keys - live_keys
+                for k in to_remove_candidates:
+                    row_data = self.device_rows.get(k)
+                    if row_data and row_data["dev"].get("is_local_or_router"):
+                        continue
+                    threshold = 1 if k.startswith("USB:") else 3
+                    self.missing_counters[k] = self.missing_counters.get(k, 0) + 1
+                    if self.missing_counters[k] >= threshold:
+                        self.missing_counters.pop(k, None)
+                        self.post_gui(self._remove_device_row, k)
+
+                common_keys = current_keys & live_keys
+                for k in common_keys:
+                    self.missing_counters[k] = 0
+                    dev = live_map[k]
+                    row_info = self.device_rows.get(k)
+                    if row_info:
+                        old_dev = row_info["dev"]
+                        if (old_dev.get("is_adb_connected") != dev.get("is_adb_connected") or
+                            old_dev.get("is_port_open") != dev.get("is_port_open") or
+                            old_dev.get("name") != dev.get("name") or
+                            old_dev.get("port") != dev.get("port") or
+                            old_dev.get("serial") != dev.get("serial") or
+                            old_dev.get("is_on_current_net") != dev.get("is_on_current_net")):
+                            self.post_gui(self._update_row_state_by_key, k, dev)
+
+            except Exception:
+                pass
+
+    # ==========================================================================
+    # MANIPULACIÓN IN-SITU DE FILAS
+    # ==========================================================================
+
+    def _create_row(self, dev):
+        dev_key = dev.get("key") or (f"USB:{dev['serial']}" if dev.get("is_usb") else dev["ip"])
+        dev["key"] = dev_key
+
+        if dev_key in self.device_rows:
+            return
+
+        group_name = dev.get("network") or "Otros"
+        if dev.get("is_usb"):
+            group_name = "USB Directo"
+
+        _, rows_container = self._get_or_create_group_container(group_name)
+
+        row = ttk.Frame(rows_container, padding=4)
+        row.pack(fill=tk.X, expand=True, pady=2)
+
+        is_usb = dev.get("is_usb", False)
+        is_adb = dev.get("is_adb_connected", False)
+        is_sys = dev.get("is_local_or_router", False)
+        is_port_open = dev.get("is_port_open", False)
+        is_on_net = dev.get("is_on_current_net", True)
+
+        can_connect = (not is_adb and not is_usb and not is_sys and is_on_net)
+
+        chk_var = tk.BooleanVar(value=False)
+        chk = ttk.Checkbutton(row, variable=chk_var, width=3)
+        chk.pack(side=tk.LEFT, padx=4)
+        if not can_connect:
+            chk.config(state=tk.DISABLED)
+
+        display_name = dev["name"]
+        if dev.get("is_static"):
+            display_name = f"⭐ {display_name} [Estática]"
+        elif is_usb:
+            display_name = f"🔌 {display_name}"
+
+        lbl_name = ttk.Label(row, text=display_name, width=26, anchor=tk.W, font=("Segoe UI", 9, "bold"))
+        lbl_name.pack(side=tk.LEFT, padx=3)
+
+        lbl_ip = ttk.Label(row, text=dev["ip"], width=20, anchor=tk.W, font=("Consolas", 10))
+        lbl_ip.pack(side=tk.LEFT, padx=3)
+
+        lbl_mac = ttk.Label(row, text=dev["mac"] or "-", width=17, anchor=tk.W, font=("Consolas", 9), foreground="#555555")
+        lbl_mac.pack(side=tk.LEFT, padx=3)
+
+        if dev.get("is_offline"):
+            status_text = "▲ USB (Offline)"
+            status_color = "#b36b00"
+        elif dev.get("is_unauthorized"):
+            status_text = "▲ USB (Aceptar en pantalla)"
+            status_color = "#b36b00"
+        elif is_usb:
+            status_text = "● Conectado (USB)"
+            status_color = "green"
+        elif is_adb:
+            status_text = f"● Conectado ADB ({dev.get('port', '5555')})"
+            status_color = "green"
+        elif is_port_open and is_on_net:
+            status_text = "● ADB disponible"
+            status_color = "#0066cc"
+        elif is_sys:
+            status_text = "○ Red / Sistema"
+            status_color = "#777777"
+        elif not is_on_net:
+            status_text = f"○ Fuera de red ({group_name})"
+            status_color = "#888888"
+        else:
+            status_text = "○ Activo en Red"
+            status_color = "#444444"
+
+        lbl_status = ttk.Label(row, text=status_text, foreground=status_color, width=24, anchor=tk.W)
+        lbl_status.pack(side=tk.LEFT, padx=3)
+
+        # Columna de botones
+        ctrl_frame = ttk.Frame(row)
+        ctrl_frame.pack(side=tk.LEFT, padx=2)
+
+        displays = dev.get("displays", [0])
+
+        # 1. Botón unificado "Conectar" / "Desconectar" / "Modo Wi-Fi"
+        can_desc = (is_adb and not is_usb and not is_sys)
+        if is_usb:
+            btn_text = "🔄 Reconectar" if dev.get("is_offline") else "⚡ Modo Wi-Fi"
+            btn_conectar = ttk.Button(
+                ctrl_frame,
+                text=btn_text,
+                width=12,
+                command=lambda d=dev: self.enable_wifi_mode_for_usb_device(d)
+            )
+            btn_conectar.pack(side=tk.LEFT, padx=2)
+            btn_conectar.config(state=tk.NORMAL)
+        elif is_adb:
+            btn_conectar = ttk.Button(
+                ctrl_frame,
+                text="Desconectar",
+                width=11,
+                command=lambda d=dev: self.disconnect_single_device(d)
+            )
+            btn_conectar.pack(side=tk.LEFT, padx=2)
+            btn_conectar.config(state=tk.NORMAL if can_desc else tk.DISABLED)
+        else:
+            btn_conectar = ttk.Button(
+                ctrl_frame,
+                text="Conectar",
+                width=11,
+                command=lambda d=dev: self.connect_single_device(d)
+            )
+            btn_conectar.pack(side=tk.LEFT, padx=2)
+            btn_conectar.config(state=tk.NORMAL if can_connect else tk.DISABLED)
+
+        # 2. Botón "Pantalla" con opciones de pantalla normal o pantalla física apagada
+        can_screen = (is_adb or is_usb or (is_port_open and not is_sys and is_on_net))
+        pantalla_widget = None
+        if len(displays) >= 2 or "e800" in (dev.get("name") or "").lower():
+            mb_pantalla = ttk.Menubutton(ctrl_frame, text="Pantalla ▾", width=11)
+            menu_pantalla = tk.Menu(mb_pantalla, tearoff=0)
+            menu_pantalla.add_command(
+                label="🖥 Pantalla 1 (Principal)",
+                command=lambda d=dev: self.start_control_session(d, display_id=0, turn_screen_off=False)
+            )
+            menu_pantalla.add_command(
+                label="🕶 Pantalla 1 (Física Apagada)",
+                command=lambda d=dev: self.start_control_session(d, display_id=0, turn_screen_off=True)
+            )
+            menu_pantalla.add_separator()
+            menu_pantalla.add_command(
+                label="🖥 Pantalla 2 (Cliente)",
+                command=lambda d=dev: self.start_control_session(d, display_id=1, turn_screen_off=False)
+            )
+            mb_pantalla["menu"] = menu_pantalla
+            mb_pantalla.pack(side=tk.LEFT, padx=2)
+            mb_pantalla.config(state=tk.NORMAL if can_screen else tk.DISABLED)
+            pantalla_widget = mb_pantalla
+        else:
+            mb_pantalla = ttk.Menubutton(ctrl_frame, text="Pantalla ▾", width=11)
+            menu_pantalla = tk.Menu(mb_pantalla, tearoff=0)
+            menu_pantalla.add_command(
+                label="🖥 Pantalla Normal",
+                command=lambda d=dev: self.start_control_session(d, display_id=0, turn_screen_off=False)
+            )
+            menu_pantalla.add_command(
+                label="🕶 Pantalla (Física Apagada)",
+                command=lambda d=dev: self.start_control_session(d, display_id=0, turn_screen_off=True)
+            )
+            mb_pantalla["menu"] = menu_pantalla
+            mb_pantalla.pack(side=tk.LEFT, padx=2)
+            mb_pantalla.config(state=tk.NORMAL if can_screen else tk.DISABLED)
+            pantalla_widget = mb_pantalla
+
+        # 3. Botón "📁 Archivos" (Explorador integrado ADB para transferir archivos sin bloqueos)
+        can_files = (is_adb or is_usb)
+        btn_files = ttk.Button(
+            ctrl_frame,
+            text="📁 Archivos",
+            width=10,
+            command=lambda d=dev: self.open_device_file_manager(d)
+        )
+        btn_files.pack(side=tk.LEFT, padx=2)
+        btn_files.config(state=tk.NORMAL if can_files else tk.DISABLED)
+
+        # 3. Botón de puerto:
+        # - Solo PAX E700, PAX E800 y PAX A920Pro muestran "Abrir puerto 5555" / "Cerrar puerto 5555"
+        # - Todos los demás dispositivos muestran el botón "Puerto" para depuración inalámbrica
+        if is_sys:
+            btn_port_toggle = ttk.Button(
+                ctrl_frame,
+                text="-",
+                width=17,
+                state=tk.DISABLED
+            )
+        elif is_pax_5555_device(dev):
+            if is_port_open or is_adb:
+                btn_port_toggle = ttk.Button(
+                    ctrl_frame,
+                    text="Cerrar puerto 5555",
+                    width=17,
+                    command=lambda d=dev: self.toggle_port_5555(d, open_it=False)
+                )
+            else:
+                btn_port_toggle = ttk.Button(
+                    ctrl_frame,
+                    text="Abrir puerto 5555",
+                    width=17,
+                    command=lambda d=dev: self.toggle_port_5555(d, open_it=True)
+                )
+            btn_port_toggle.config(state=tk.NORMAL)
+        else:
+            btn_port_toggle = ttk.Button(
+                ctrl_frame,
+                text="Puerto",
+                width=17,
+                command=lambda d=dev: self.prompt_custom_port(d)
+            )
+            btn_port_toggle.config(state=tk.NORMAL)
+
+        btn_port_toggle.pack(side=tk.LEFT, padx=2)
+
+        # Menú contextual para cambiar de red
+        def _popup_menu(event, d=dev):
+            m = tk.Menu(self.root, tearoff=0)
+            m.add_command(label="🏢 Asignar a: Sitio de Trabajo", command=lambda: self.change_device_network(d, "Sitio de Trabajo"))
+            m.add_command(label="🏠 Asignar a: Casa (Familia Rosales Martinez)", command=lambda: self.change_device_network(d, "Casa (Familia Rosales Martinez)"))
+            m.tk_popup(event.x_root, event.y_root)
+
+        row.bind("<Button-3>", _popup_menu)
+        lbl_name.bind("<Button-3>", _popup_menu)
+        lbl_ip.bind("<Button-3>", _popup_menu)
+
+        self.device_rows[dev_key] = {
+            "row_frame": row,
+            "chk": chk,
+            "chk_var": chk_var,
+            "name_lbl": lbl_name,
+            "ip_lbl": lbl_ip,
+            "mac_lbl": lbl_mac,
+            "status_lbl": lbl_status,
+            "ctrl_frame": ctrl_frame,
+            "btn_conectar": btn_conectar,
+            "pantalla_widget": pantalla_widget,
+            "btn_files": btn_files,
+            "btn_port_toggle": btn_port_toggle,
+            "dev": dev,
+            "group_name": group_name
+        }
+
+    def change_device_network(self, dev, new_network):
+        ip = dev.get("ip")
+        dev["network"] = new_network
+        if ip and not dev.get("is_usb"):
+            save_known_device(ip, name=dev["name"], mac=dev.get("mac", ""), is_static=dev.get("is_static", False), last_port=dev.get("port", ""), network=new_network)
+        self.set_status(f"Dispositivo {dev['name']} asignado a: {new_network}")
+        self.trigger_scan()
+
+    def _add_device_row(self, dev):
+        self._create_row(dev)
+        self.apply_filter()
+        self._update_network_subtitle()
+
+    def _remove_device_row(self, dev_key):
+        row_info = self.device_rows.pop(dev_key, None)
+        if row_info:
+            row_info["row_frame"].destroy()
+            self.apply_filter()
+            self._update_network_subtitle()
+
+    def _update_row_state_by_key(self, dev_key, dev):
+        row_info = self.device_rows.get(dev_key)
+        if not row_info:
+            return
+
+        row_info["dev"] = dev
+        is_usb = dev.get("is_usb", False)
+        is_adb = dev.get("is_adb_connected", False)
+        is_sys = dev.get("is_local_or_router", False)
+        is_port_open = dev.get("is_port_open", False)
+        is_on_net = dev.get("is_on_current_net", True)
+        group_name = dev.get("network", "Otros")
+
+        display_name = dev["name"]
+        if dev.get("is_static"):
+            display_name = f"⭐ {display_name} [Estática]"
+        elif is_usb:
+            display_name = f"🔌 {display_name}"
+        row_info["name_lbl"].config(text=display_name)
+
+        if is_usb:
+            status_text = "● Conectado (USB)"
+            status_color = "green"
+        elif is_adb:
+            status_text = f"● Conectado ADB ({dev.get('port', '5555')})"
+            status_color = "green"
+        elif is_port_open and is_on_net:
+            status_text = "● ADB disponible"
+            status_color = "#0066cc"
+        elif is_sys:
+            status_text = "○ Red / Sistema"
+            status_color = "#777777"
+        elif not is_on_net:
+            status_text = f"○ Fuera de red ({group_name})"
+            status_color = "#888888"
+        else:
+            status_text = "○ Activo en Red"
+            status_color = "#444444"
+
+        row_info["status_lbl"].config(text=status_text, foreground=status_color)
+
+        can_connect = (not is_adb and not is_usb and not is_sys and is_on_net)
+        can_desc = (is_adb and not is_usb and not is_sys)
+        btn_con = row_info.get("btn_conectar")
+        if btn_con:
+            if is_usb:
+                btn_con.config(
+                    text="⚡ Modo Wi-Fi",
+                    state=tk.NORMAL,
+                    command=lambda d=dev: self.enable_wifi_mode_for_usb_device(d)
+                )
+            elif is_adb:
+                btn_con.config(
+                    text="Desconectar",
+                    state=tk.NORMAL if can_desc else tk.DISABLED,
+                    command=lambda d=dev: self.disconnect_single_device(d)
+                )
+            else:
+                btn_con.config(
+                    text="Conectar",
+                    state=tk.NORMAL if can_connect else tk.DISABLED,
+                    command=lambda d=dev: self.connect_single_device(d)
+                )
+
+        btn_f = row_info.get("btn_files")
+        if btn_f:
+            btn_f.config(state=tk.NORMAL if (is_adb or is_usb) else tk.DISABLED)
+
+        can_screen = (is_adb or is_usb or (is_port_open and not is_sys and is_on_net))
+        pantalla_w = row_info.get("pantalla_widget")
+        if pantalla_w:
+            pantalla_w.config(state=tk.NORMAL if can_screen else tk.DISABLED)
+
+        btn_port = row_info.get("btn_port_toggle")
+        if btn_port:
+            if is_sys:
+                btn_port.config(text="-", state=tk.DISABLED)
+            elif is_pax_5555_device(dev):
+                if is_port_open or is_adb:
+                    btn_port.config(
+                        text="Cerrar puerto 5555",
+                        state=tk.NORMAL,
+                        command=lambda d=dev: self.toggle_port_5555(d, open_it=False)
+                    )
+                else:
+                    btn_port.config(
+                        text="Abrir puerto 5555",
+                        state=tk.NORMAL,
+                        command=lambda d=dev: self.toggle_port_5555(d, open_it=True)
+                    )
+            else:
+                btn_port.config(
+                    text="Puerto",
+                    state=tk.NORMAL,
+                    command=lambda d=dev: self.prompt_custom_port(d)
+                )
+
+        chk = row_info.get("chk")
+        if chk:
+            chk.config(state=tk.NORMAL if can_connect else tk.DISABLED)
+            if not can_connect:
+                row_info["chk_var"].set(False)
+
+        # Reordenar dinámicamente según el estado de conexión y la IP
+        self.apply_filter()
+
+    # ==========================================================================
+    # ACCIONES INDIVIDUALES (CONECTAR, DESCONECTAR, PANTALLA)
+    # ==========================================================================
+
+    def connect_single_device(self, dev):
+        """Conecta un dispositivo individual seleccionado a ADB."""
+        dev_key = dev["key"]
+        self.set_status(f"Conectando ADB a {dev['name']} ({dev['ip']})...")
+        threading.Thread(target=self._connect_single_worker, args=(dev,), daemon=True).start()
+
+    def _connect_single_worker(self, dev):
+        dev_key = dev["key"]
+        ip = dev["ip"]
+        known_p = dev.get("port", "")
+        row_info = self.device_rows.get(dev_key)
+        if row_info:
+            self.post_gui(lambda inf=row_info: inf["status_lbl"].config(text="⏳ Conectando...", foreground="#b36b00"))
+
+        self.user_disconnected.discard(ip)
+        self.user_disconnected.discard(f"{ip}:{known_p}")
+        ok, detail, model = connect_ip_automatically(ip, known_port=known_p, status_callback=self.set_status)
+        if ok:
+            ensure_storage_mount()
+            ensure_device_internet_stability(detail)
+            dev["is_adb_connected"] = True
+            dev["serial"] = detail
+            if model:
+                dev["name"] = model
+            self.set_status(f"¡Conectado exitosamente a {dev['name']} ({detail})!")
+            self.post_gui(self._update_row_state_by_key, dev_key, dev)
+        else:
+            open_now = check_tcp_ports_fast(ip, [5555, 7888])
+            dev["is_port_open"] = bool(open_now)
+            self.set_status(f"No se pudo conectar a {dev['name']}: {detail}")
+            self.post_gui(self._update_row_state_by_key, dev_key, dev)
+            self.post_gui(messagebox.showwarning, "Error de Conexión ADB", f"No se pudo conectar a {dev['name']}:\n{detail}")
+
+    def disconnect_single_device(self, dev):
+        """Desconecta el dispositivo seleccionado de ADB. PERMANECE DESCONECTADO sin reconexión automática."""
+        dev_key = dev["key"]
+        ip = dev["ip"]
+        if dev.get("is_usb") and not dev.get("serial", "").startswith(ip):
+            messagebox.showinfo("Dispositivo USB Directo", f"{dev['name']} está conectado físicamente por cable USB directo.")
+            return
+
+        serial_target = dev.get("serial") or (f"{ip}:{dev['port']}" if dev.get("port") else ip)
+        self.user_disconnected.add(ip)
+        self.user_disconnected.add(serial_target)
+        if ":" in serial_target:
+            self.user_disconnected.add(serial_target.split(":")[0])
+        self.set_status(f"Desconectando {dev['name']} ({serial_target})...")
+        cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        try:
+            subprocess.run(["adb", "disconnect", serial_target], capture_output=True, creationflags=cflags, timeout=3)
+            if ":" in serial_target:
+                subprocess.run(["adb", "disconnect", serial_target.split(":")[0]], capture_output=True, creationflags=cflags, timeout=2)
+            dev["is_adb_connected"] = False
+            open_p = check_tcp_ports_fast(ip, [5555, 7888])
+            dev["is_port_open"] = bool(open_p)
+            if open_p:
+                dev["port"] = open_p[0]
+            self.set_status(f"Dispositivo {dev['name']} desconectado de ADB.")
+            self.post_gui(self._update_row_state_by_key, dev_key, dev)
+        except Exception as e:
+            self.set_status(f"Error al desconectar: {e}")
+
+
+    def enable_wifi_mode_for_usb_device(self, dev):
+        """Activa el modo Wi-Fi (puerto 5555) en un dispositivo conectado por cable USB."""
+        serial = dev.get("serial")
+        if not serial or ":" in serial:
+            usb_devs = get_usb_connected_devices()
+            for u in usb_devs:
+                if u.get("serial"):
+                    serial = u["serial"]
+                    break
+
+        if not serial:
+            messagebox.showwarning("Sin Conexión USB", "No se detectó ningún dispositivo Android conectado por cable USB.")
+            return
+
+        dev_title = dev.get("name", "dispositivo")
+        self.set_status(f"Activando modo Wi-Fi en {dev_title} ({serial})...")
+        cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+        def _worker():
+            try:
+                # 1. Consultar TODAS las IPs reales en vivo, modelo, SSID y MAC por USB antes de tocar tcpip 5555
+                net_det = get_usb_device_net_details(serial, cflags=cflags)
+                dev_ssid, dev_mac = get_usb_device_ssid_and_mac(serial, cflags=cflags)
+                cand_ips = list(net_det.get("all_ips", []))
+
+                if not cand_ips and dev.get("wlan_ip"):
+                    cand_ips.append(dev["wlan_ip"])
+                elif not cand_ips and dev.get("ip"):
+                    m_dev_ip = re.search(r"(\d+\.\d+\.\d+\.\d+)", str(dev.get("ip", "")))
+                    if m_dev_ip:
+                        cand_ips.append(m_dev_ip.group(1))
+
+                dev_name = dev.get("name", "Android")
+                m_prop = net_det.get("model", "")
+                if m_prop and ("USB" in dev_name or "dispositivo" in dev_name.lower()):
+                    if m_prop.startswith("E") or m_prop.startswith("A920") or "e700" in m_prop.lower() or "e800" in m_prop.lower():
+                        dev_name = f"PAX {m_prop}"
+                    elif "A23" in m_prop or m_prop.startswith("SM_A"):
+                        dev_name = f"Samsung {m_prop}"
+                    else:
+                        dev_name = m_prop
+
+                # 2. Actualizar red actual del PC sin depender de cache viejo
+                pc_ip, pc_subnet, _, pc_net_name = get_network_info()
+                pc_ssid = get_current_wifi_ssid()
+                self.local_ip = pc_ip
+                self.subnet = pc_subnet
+                self.current_net_name = pc_net_name
+
+                if not cand_ips:
+                    prepare_usb_device_for_wifi_adb(serial, cflags=cflags, port=5555)
+                    self.post_gui(messagebox.showwarning, "Sin Red Wi-Fi en el Equipo",
+                                  f"El puerto 5555 fue habilitado en {dev_name} ({serial}), pero el equipo no está conectado a ninguna red Wi-Fi.\n\n"
+                                  f"Conecta el {dev_name} al Wi-Fi (puedes abrir Pantalla directamente por USB mientras tanto) e inténtalo de nuevo.")
+                    return
+
+                # 3. Despertar tabla ARP y puente entre bandas (ej. 5GHz <-> 2.4GHz) desde el equipo hacia el PC
+                ping_ok, _ = wake_device_to_pc_route(serial, pc_ip, cflags=cflags)
+
+                # 4. Probar primero si ya conecta directo por Wi-Fi sin reiniciar adbd innecesariamente
+                connected_ip = ""
+                conn_out = ""
+                is_wifi_online = False
+                for try_ip in cand_ips:
+                    ok_pre, out_pre, _ = connect_adb_endpoint_verified(f"{try_ip}:5555", cflags=cflags, attempts=1)
+                    if ok_pre:
+                        connected_ip = try_ip
+                        conn_out = out_pre
+                        is_wifi_online = True
+                        break
+
+                # 5. Si no conectó directo, habilitar tcpip 5555 de forma segura y volver a despertar ARP + conectar
+                if not is_wifi_online:
+                    self.set_status(f"Abriendo puerto 5555 en {dev_name} ({serial})...")
+                    prepare_usb_device_for_wifi_adb(serial, cflags=cflags, port=5555, force_tcpip=True)
+                    ping_ok2, _ = wake_device_to_pc_route(serial, pc_ip, cflags=cflags)
+                    ping_ok = ping_ok or ping_ok2
+                    for try_ip in cand_ips:
+                        ok_post, out_post, is_unauth = connect_adb_endpoint_verified(f"{try_ip}:5555", cflags=cflags, attempts=2)
+                        conn_out = out_post
+                        if ok_post:
+                            connected_ip = try_ip
+                            is_wifi_online = True
+                            break
+                        if is_unauth:
+                            break
+
+                primary_ip = connected_ip or cand_ips[0]
+                if is_wifi_online:
+                    save_known_device(primary_ip, name=dev_name, mac=dev_mac, is_static=True, last_port="5555", network=pc_net_name)
+                    ensure_device_internet_stability(f"{primary_ip}:5555")
+                    net_label = dev_ssid or pc_net_name
+                    self.post_gui(messagebox.showinfo, "¡Conexión Wi-Fi Exitosa!",
+                                  f"¡{dev_name} conectado exitosamente por Wi-Fi en {primary_ip}:5555!\n"
+                                  f"Red: {net_label}\n\n"
+                                  f"Ya puedes desconectar el cable USB si lo deseas.")
+                    self.set_status(f"¡{dev_name} conectado por Wi-Fi en {primary_ip}:5555!")
+                else:
+                    if not ping_ok:
+                        self.post_gui(messagebox.showwarning, "Redes Wi-Fi Aisladas o Distintas",
+                                      f"El puerto 5555 quedó activo por USB, pero no hay ruta de red Wi-Fi entre ambos equipos:\n\n"
+                                      f"• {dev_name}: Red '{dev_ssid or 'Desconocida'}' (IP {primary_ip})\n"
+                                      f"• Este PC: Red '{pc_ssid or pc_net_name}' (IP {pc_ip})\n\n"
+                                      f"Conéctalos a la misma red Wi-Fi/hotspot para usar conexión inalámbrica. Mientras tanto, 'Pantalla' y 'Archivos' siguen funcionando por cable USB.")
+                    else:
+                        self.post_gui(messagebox.showwarning, "Puerto 5555 Activo — Sin Respuesta Wi-Fi",
+                                      f"El puerto 5555 se abrió en {dev_name} ({primary_ip}), pero ADB no completó el enlace:\n{conn_out}\n\n"
+                                      f"En {dev_name}, verifica que el Wi-Fi no tenga aislamiento de clientes o reinicia Depuración USB.")
+
+                self.trigger_scan()
+            except Exception as ex:
+                self.post_gui(messagebox.showerror, "Error", f"Error al activar modo Wi-Fi: {ex}")
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def open_device_file_manager(self, dev):
+        """Abre el Explorador de Archivos ADB integrado con barra de progreso estilo Windows,
+        arrastrar y soltar (Drag and Drop), copiar/cortar/pegar y atajos de teclado."""
+        dev_name = dev.get("name", "Dispositivo")
+        ip = dev.get("ip", "")
+        serial = dev.get("serial", "")
+        target = resolve_active_adb_target(ip, dev=dev) or serial or ip
+        if not target:
+            messagebox.showwarning("No Conectado", f"{dev_name} no se encuentra conectado a ADB.")
+            return
+
+        mounted_drive = get_device_mounted_drive(dev_name, ip or serial)
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"📁 Explorador de Archivos ADB - {dev_name} ({target})")
+        dialog.geometry("920x640")
+        dialog.minsize(760, 520)
+        dialog.transient(self.root)
+
+        cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+        # Clipboard interno para transferencias dentro del dispositivo Android
+        # {"action": "copy"|"cut", "source_dir": str, "items": list}
+        device_clipboard = {"action": "", "source_dir": "", "items": []}
+
+        # Funciones auxiliares de formateo (Estilo Windows)
+        def _format_size(sz):
+            if sz < 1024:
+                return f"{sz} B"
+            elif sz < 1024 * 1024:
+                return f"{sz / 1024.0:.1f} KB"
+            elif sz < 1024 * 1024 * 1024:
+                return f"{sz / (1024.0 * 1024.0):.1f} MB"
+            else:
+                return f"{sz / (1024.0 * 1024.0 * 1024.0):.2f} GB"
+
+        def _format_speed(bps):
+            if bps < 1024:
+                return f"{bps:.0f} B/s"
+            elif bps < 1024 * 1024:
+                return f"{bps / 1024.0:.1f} KB/s"
+            else:
+                return f"{bps / (1024.0 * 1024.0):.1f} MB/s"
+
+        def _format_eta(seconds):
+            if seconds is None or seconds <= 0:
+                return "Calculando..."
+            s = int(seconds)
+            if s < 60:
+                return f"Aprox. {s} segundo{'s' if s != 1 else ''}"
+            m = s // 60
+            rem_s = s % 60
+            if m < 60:
+                return f"Aprox. {m} min {rem_s} s"
+            h = m // 60
+            rem_m = m % 60
+            return f"Aprox. {h} h {rem_m} min"
+
+        def _get_windows_clipboard_files():
+            """Lee archivos del portapapeles de Windows (CF_HDROP = 15)."""
+            files = []
+            try:
+                user32 = ctypes.windll.user32
+                shell32 = ctypes.windll.shell32
+                if not user32.OpenClipboard(None):
+                    return files
+                try:
+                    h_drop = user32.GetClipboardData(15)
+                    if h_drop:
+                        count = shell32.DragQueryFileW(h_drop, 0xFFFFFFFF, None, 0)
+                        buf = ctypes.create_unicode_buffer(1024)
+                        for i in range(count):
+                            shell32.DragQueryFileW(h_drop, i, buf, 1024)
+                            val = buf.value
+                            if val and os.path.exists(val):
+                                files.append(val)
+                finally:
+                    user32.CloseClipboard()
+            except Exception:
+                pass
+            return files
+
+        # ----------------------------------------------------------------------
+        # DIÁLOGO DE TRANSFERENCIA CON BARRA DE PROGRESO ESTILO WINDOWS Y ETA
+        # ----------------------------------------------------------------------
+        def run_transfer_with_progress(is_upload, file_pairs, on_complete=None):
+            """
+            Ejecuta la subida o descarga de archivos mostrando una ventana de progreso
+            idéntica a Windows con: porcentaje, velocidad en tiempo real, tiempo restante y botón Cancelar.
+            file_pairs: lista de dicts con:
+              {
+                "src": str,
+                "dest_dir": str,
+                "dest_name": str,
+                "size": int (bytes esperados)
+              }
+            """
+            if not file_pairs:
+                return
+
+            total_items = len(file_pairs)
+            total_bytes = sum(max(1, p.get("size", 1)) for p in file_pairs)
+
+            # Ventana modal de progreso
+            pwin = tk.Toplevel(dialog)
+            title_verb = "Subiendo a" if is_upload else "Descargando de"
+            pwin.title(f"{title_verb} {dev_name}...")
+            pwin.geometry("540x230")
+            pwin.resizable(False, False)
+            pwin.transient(dialog)
+
+            # Centrar sobre la ventana del explorador
+            try:
+                dialog.update_idletasks()
+                gx = dialog.winfo_rootx() + (dialog.winfo_width() - 540) // 2
+                gy = dialog.winfo_rooty() + (dialog.winfo_height() - 230) // 2
+                pwin.geometry(f"540x230+{max(0, gx)}+{max(0, gy)}")
+            except Exception:
+                pass
+
+            pframe = ttk.Frame(pwin, padding=16)
+            pframe.pack(fill=tk.BOTH, expand=True)
+
+            action_icon = "📤" if is_upload else "📥"
+            main_header = f"{action_icon} {title_verb} {dev_name}"
+            lbl_title = ttk.Label(pframe, text=main_header, font=("Segoe UI", 11, "bold"))
+            lbl_title.pack(anchor=tk.W, pady=(0, 4))
+
+            lbl_file = ttk.Label(pframe, text="Iniciando transferencia...", font=("Segoe UI", 9))
+            lbl_file.pack(anchor=tk.W, pady=(0, 2))
+
+            lbl_stats = ttk.Label(pframe, text="Velocidad: Calculando...  •  Tiempo restante: Calculando...",
+                                  font=("Segoe UI", 9), foreground="#0055aa")
+            lbl_stats.pack(anchor=tk.W, pady=(0, 8))
+
+            progress_var = tk.DoubleVar(value=0.0)
+            progressbar = ttk.Progressbar(pframe, variable=progress_var, maximum=100.0, mode="determinate")
+            progressbar.pack(fill=tk.X, pady=(0, 4))
+
+            lbl_size = ttk.Label(pframe, text=f"0 B de {_format_size(total_bytes)} (0%)",
+                                 font=("Segoe UI", 8), foreground="#555555")
+            lbl_size.pack(anchor=tk.W, pady=(0, 8))
+
+            cancel_flag = {"cancelled": False, "proc": None}
+
+            def _on_cancel():
+                cancel_flag["cancelled"] = True
+                proc = cancel_flag.get("proc")
+                if proc:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                lbl_stats.config(text="Cancelando transferencia...", foreground="#cc0000")
+                pwin.destroy()
+
+            btn_frame = ttk.Frame(pframe)
+            btn_frame.pack(fill=tk.X)
+            btn_cancel = ttk.Button(btn_frame, text="Cancelar", width=12, command=_on_cancel)
+            btn_cancel.pack(side=tk.RIGHT)
+
+            pwin.protocol("WM_DELETE_WINDOW", _on_cancel)
+
+            def _worker():
+                bytes_completed_before = 0
+                transfer_start_time = time.time()
+                last_time = transfer_start_time
+                last_bytes = 0
+
+                for idx, item in enumerate(file_pairs, 1):
+                    if cancel_flag["cancelled"]:
+                        break
+
+                    src_path = item["src"]
+                    dest_dir = item["dest_dir"]
+                    dest_name = item["dest_name"]
+                    item_size = item.get("size", 1)
+
+                    # Actualizar GUI: archivo actual
+                    def _update_file_label(i=idx, n=dest_name):
+                        if not pwin.winfo_exists():
+                            return
+                        lbl_file.config(text=f"Elemento {i} de {total_items}: {n}")
+                    pwin.after(0, _update_file_label)
+
+                    if is_upload:
+                        cmd = ["adb", "-s", str(target), "push", src_path, dest_dir]
+                        remote_dest_file = dest_dir.rstrip("/") + "/" + dest_name
+                    else:
+                        cmd = ["adb", "-s", str(target), "pull", src_path, dest_dir]
+                        local_dest_file = os.path.join(dest_dir, dest_name)
+
+                    try:
+                        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                                creationflags=cflags)
+                        cancel_flag["proc"] = proc
+
+                        while proc.poll() is None:
+                            if cancel_flag["cancelled"]:
+                                proc.terminate()
+                                break
+
+                            # Medir bytes del archivo actual
+                            current_item_done = 0
+                            if is_upload:
+                                try:
+                                    s_res = subprocess.run(["adb", "-s", str(target), "shell", f'stat -c %s "{remote_dest_file}"'],
+                                                           capture_output=True, text=True, creationflags=cflags, timeout=1.2)
+                                    s_out = s_res.stdout.strip()
+                                    if s_out.isdigit():
+                                        current_item_done = min(item_size, int(s_out))
+                                except Exception:
+                                    pass
+                            else:
+                                if os.path.exists(local_dest_file):
+                                    try:
+                                        current_item_done = min(item_size, os.path.getsize(local_dest_file))
+                                    except Exception:
+                                        pass
+
+                            total_done = bytes_completed_before + current_item_done
+                            now = time.time()
+                            elapsed_total = max(0.1, now - transfer_start_time)
+                            speed_bps = total_done / elapsed_total
+
+                            remaining_bytes = max(0, total_bytes - total_done)
+                            eta_secs = remaining_bytes / max(1024.0, speed_bps) if speed_bps > 0 else 0
+
+                            pct = min(100.0, (total_done / total_bytes) * 100.0)
+                            speed_txt = _format_speed(speed_bps)
+                            eta_txt = _format_eta(eta_secs)
+                            size_txt = f"{_format_size(total_done)} de {_format_size(total_bytes)} ({pct:.0f}%)"
+
+                            def _update_progress(p=pct, sp=speed_txt, et=eta_txt, sz=size_txt):
+                                if not pwin.winfo_exists():
+                                    return
+                                progress_var.set(p)
+                                lbl_stats.config(text=f"Velocidad: {sp}  •  Tiempo restante: {et}")
+                                lbl_size.config(text=sz)
+
+                            pwin.after(0, _update_progress)
+                            time.sleep(0.3)
+
+                        proc.wait()
+                        bytes_completed_before += item_size
+                    except Exception as ex:
+                        pass
+
+                # Al terminar
+                def _finish():
+                    if pwin.winfo_exists():
+                        progress_var.set(100.0)
+                        pwin.destroy()
+                    if cancel_flag["cancelled"]:
+                        status_lbl.config(text="Transferencia cancelada por el usuario.")
+                    else:
+                        status_lbl.config(text=f"✔ ¡Transferencia completada: {total_items} elemento(s) ({_format_size(total_bytes)})!")
+                    if on_complete:
+                        on_complete()
+
+                dialog.after(0, _finish)
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+        # ----------------------------------------------------------------------
+        # BARRA SUPERIOR E INFORMACIÓN DE DISPOSITIVO / UNIDAD WINDOWS
+        # ----------------------------------------------------------------------
+        banner_frame = ttk.Frame(dialog, padding=(10, 8, 10, 4))
+        banner_frame.pack(fill=tk.X)
+
+        drive_info_text = f"Unidad Windows: {mounted_drive}\\" if mounted_drive else "Unidad Windows: No detectada (transferencia directa ADB activa)"
+        lbl_drive_info = ttk.Label(banner_frame, text=f"📱 {dev_name}  |  {drive_info_text}", font=("Segoe UI", 9, "bold"), foreground="#0055aa")
+        lbl_drive_info.pack(side=tk.LEFT)
+
+        if mounted_drive:
+            def _open_in_windows():
+                try:
+                    subprocess.Popen(f'explorer.exe "{mounted_drive}\\"', shell=True)
+                except Exception as ex:
+                    messagebox.showerror("Error", f"No se pudo abrir la unidad: {ex}", parent=dialog)
+            btn_win_drive = ttk.Button(banner_frame, text=f"📂 Abrir {mounted_drive}\\ en Windows Explorer", command=_open_in_windows)
+            btn_win_drive.pack(side=tk.RIGHT, padx=4)
+
+        # Barra de navegación por carpetas
+        nav_frame = ttk.Frame(dialog, padding=(10, 4, 10, 6))
+        nav_frame.pack(fill=tk.X)
+
+        ttk.Label(nav_frame, text="Ruta:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(0, 4))
+
+        path_var = tk.StringVar(value="/sdcard/")
+        entry_path = ttk.Entry(nav_frame, textvariable=path_var, font=("Consolas", 10))
+        entry_path.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+
+        # Contenedor de la lista de archivos (Treeview con soporte multi-selección)
+        tree_frame = ttk.Frame(dialog, padding=(10, 2, 10, 4))
+        tree_frame.pack(fill=tk.BOTH, expand=True)
+
+        columns = ("tipo", "nombre", "tamano", "fecha")
+        tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="extended")
+        tree.heading("tipo", text="Tipo")
+        tree.heading("nombre", text="Nombre")
+        tree.heading("tamano", text="Tamaño")
+        tree.heading("fecha", text="Fecha de Modificación")
+
+        tree.column("tipo", width=80, anchor=tk.CENTER)
+        tree.column("nombre", width=420, anchor=tk.W)
+        tree.column("tamano", width=110, anchor=tk.E)
+        tree.column("fecha", width=170, anchor=tk.CENTER)
+
+        vsb = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=tree.yview)
+        hsb = ttk.Scrollbar(tree_frame, orient=tk.HORIZONTAL, command=tree.xview)
+        tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        tree_frame.grid_rowconfigure(0, weight=1)
+        tree_frame.grid_columnconfigure(0, weight=1)
+
+        status_lbl = ttk.Label(dialog, text="Listo.", relief=tk.SUNKEN, anchor=tk.W, padding=4, font=("Segoe UI", 9))
+        status_lbl.pack(fill=tk.X, side=tk.BOTTOM)
+
+        current_items = []
+
+        def load_directory(target_path):
+            norm_path = target_path.strip()
+            if not norm_path.endswith("/"):
+                norm_path += "/"
+            path_var.set(norm_path)
+            status_lbl.config(text=f"Cargando archivos de {norm_path}...")
+            dialog.config(cursor="watch")
+
+            def _fetch():
+                items = []
+                try:
+                    res = subprocess.run(["adb", "-s", str(target), "shell", f'ls -la "{norm_path}"'],
+                                         capture_output=True, text=True, errors="replace", creationflags=cflags, timeout=8)
+                    for line in res.stdout.splitlines():
+                        line = line.strip()
+                        m = re.match(r"^([drwxsStT\-]{10})\s+\d+\s+\S+\s+\S+\s+(\d+)\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s+(.+)$", line)
+                        if m:
+                            perms, size, dt, name = m.groups()
+                            if name in (".", ".."):
+                                continue
+                            is_dir = perms.startswith("d")
+                            items.append({
+                                "name": name,
+                                "is_dir": is_dir,
+                                "size": int(size),
+                                "size_str": "-" if is_dir else _format_size(int(size)),
+                                "date": dt
+                            })
+                    items.sort(key=lambda x: (0 if x["is_dir"] else 1, x["name"].lower()))
+                except Exception:
+                    pass
+
+                def _populate():
+                    for row_id in tree.get_children():
+                        tree.delete(row_id)
+                    current_items.clear()
+                    for it in items:
+                        current_items.append(it)
+                        icon_type = "📁 Carpeta" if it["is_dir"] else "📄 Archivo"
+                        tree.insert("", tk.END, values=(icon_type, it["name"], it["size_str"], it["date"]))
+                    dirs_cnt = sum(1 for it in items if it["is_dir"])
+                    files_cnt = len(items) - dirs_cnt
+                    status_lbl.config(text=f"{dirs_cnt} carpetas, {files_cnt} archivos en {norm_path} | Listo.")
+                    dialog.config(cursor="")
+
+                dialog.after(0, _populate)
+
+            threading.Thread(target=_fetch, daemon=True).start()
+
+        def go_to_entered():
+            load_directory(path_var.get())
+
+        entry_path.bind("<Return>", lambda e: go_to_entered())
+        ttk.Button(nav_frame, text="Ir", width=4, command=go_to_entered).pack(side=tk.LEFT, padx=(0, 8))
+
+        def go_up():
+            curr = path_var.get().rstrip("/")
+            if "/" in curr:
+                parent = curr.rsplit("/", 1)[0]
+                if not parent:
+                    parent = "/"
+                load_directory(parent)
+
+        ttk.Button(nav_frame, text="⬆ Arriba", command=go_up).pack(side=tk.LEFT, padx=2)
+        ttk.Button(nav_frame, text="🏠 Almacenamiento", command=lambda: load_directory("/sdcard/")).pack(side=tk.LEFT, padx=2)
+        ttk.Button(nav_frame, text="📥 Descargas", command=lambda: load_directory("/sdcard/Download/")).pack(side=tk.LEFT, padx=2)
+        ttk.Button(nav_frame, text="📷 Fotos", command=lambda: load_directory("/sdcard/DCIM/")).pack(side=tk.LEFT, padx=2)
+        ttk.Button(nav_frame, text="🔄 Refrescar", command=lambda: load_directory(path_var.get())).pack(side=tk.LEFT, padx=2)
+
+        # ----------------------------------------------------------------------
+        # SUBIDA Y DESCARGA CON BARRA DE PROGRESO
+        # ----------------------------------------------------------------------
+        def upload_specific_files(file_list):
+            """Sube una lista de rutas locales de PC al directorio actual con barra de progreso."""
+            if not file_list:
+                return
+            curr_dir = path_var.get()
+            file_pairs = []
+            for src_path in file_list:
+                src_path = os.path.normpath(src_path)
+                if not os.path.exists(src_path):
+                    continue
+                name = os.path.basename(src_path)
+                sz = 1
+                if os.path.isfile(src_path):
+                    sz = os.path.getsize(src_path)
+                elif os.path.isdir(src_path):
+                    for r, d, fnames in os.walk(src_path):
+                        for fn in fnames:
+                            try:
+                                sz += os.path.getsize(os.path.join(r, fn))
+                            except Exception:
+                                pass
+                file_pairs.append({
+                    "src": src_path,
+                    "dest_dir": curr_dir,
+                    "dest_name": name,
+                    "size": sz
+                })
+
+            if not file_pairs:
+                return
+
+            run_transfer_with_progress(is_upload=True, file_pairs=file_pairs,
+                                       on_complete=lambda: load_directory(curr_dir))
+
+        def upload_files():
+            files = filedialog.askopenfilenames(parent=dialog, title="Seleccionar archivo(s) para subir al dispositivo")
+            if files:
+                upload_specific_files(files)
+
+        def upload_folder():
+            folder = filedialog.askdirectory(parent=dialog, title="Seleccionar carpeta para subir al dispositivo")
+            if folder:
+                upload_specific_files([folder])
+
+        def download_selected():
+            sel = tree.selection()
+            if not sel:
+                messagebox.showinfo("Selecciona elemento(s)", "Selecciona uno o más archivos o carpetas para descargar.", parent=dialog)
+                return
+
+            dest_dir = filedialog.askdirectory(parent=dialog, title="Seleccionar carpeta en la PC para guardar")
+            if not dest_dir:
+                return
+
+            curr_dir = path_var.get().rstrip("/")
+            file_pairs = []
+            for item_id in sel:
+                vals = tree.item(item_id, "values")
+                name = vals[1]
+                remote_full = f"{curr_dir}/{name}"
+
+                # Obtener tamaño aproximado
+                sz = 1024
+                for ci in current_items:
+                    if ci["name"] == name:
+                        sz = ci.get("size", 1024)
+                        break
+
+                file_pairs.append({
+                    "src": remote_full,
+                    "dest_dir": dest_dir,
+                    "dest_name": name,
+                    "size": max(1024, sz)
+                })
+
+            run_transfer_with_progress(is_upload=False, file_pairs=file_pairs,
+                                       on_complete=lambda: status_lbl.config(text=f"✔ Archivos descargados en {dest_dir}"))
+
+        def on_item_double_click(event):
+            sel = tree.selection()
+            if not sel:
+                return
+            item_vals = tree.item(sel[0], "values")
+            if not item_vals:
+                return
+            tipo, name = item_vals[0], item_vals[1]
+            curr_dir = path_var.get().rstrip("/")
+            if "Carpeta" in tipo:
+                new_path = f"{curr_dir}/{name}/"
+                load_directory(new_path)
+            else:
+                download_selected()
+
+        tree.bind("<Double-1>", on_item_double_click)
+        tree.bind("<Return>", on_item_double_click)
+        tree.bind("<BackSpace>", lambda e: go_up())
+
+        # ----------------------------------------------------------------------
+        # ARRASTRAR Y SOLTAR (DRAG AND DROP) DESDE WINDOWS
+        # ----------------------------------------------------------------------
+        def on_files_dropped(dropped_files):
+            if not dropped_files:
+                return
+            cleaned = []
+            for item in dropped_files:
+                if isinstance(item, bytes):
+                    try:
+                        p = item.decode("utf-8")
+                    except Exception:
+                        p = item.decode("mbcs", errors="replace")
+                else:
+                    p = str(item)
+                p = os.path.normpath(p.strip())
+                if os.path.exists(p):
+                    cleaned.append(p)
+            if cleaned:
+                upload_specific_files(cleaned)
+
+        try:
+            import windnd
+            windnd.hook_dropfiles(dialog, func=on_files_dropped, force_unicode=True)
+            windnd.hook_dropfiles(tree, func=on_files_dropped, force_unicode=True)
+        except Exception:
+            pass
+
+        # ----------------------------------------------------------------------
+        # OPERACIONES: COPIAR, CORTAR, PEGAR, RENOMBRAR, ELIMINAR
+        # ----------------------------------------------------------------------
+        def copy_selection():
+            sel = tree.selection()
+            if not sel:
+                return
+            names = [tree.item(s, "values")[1] for s in sel]
+            device_clipboard["action"] = "copy"
+            device_clipboard["source_dir"] = path_var.get().rstrip("/")
+            device_clipboard["items"] = names
+            status_lbl.config(text=f"📋 Copiado: {len(names)} elemento(s). Ve a la carpeta de destino y pulsa Pegar (Ctrl+V).")
+
+        def cut_selection():
+            sel = tree.selection()
+            if not sel:
+                return
+            names = [tree.item(s, "values")[1] for s in sel]
+            device_clipboard["action"] = "cut"
+            device_clipboard["source_dir"] = path_var.get().rstrip("/")
+            device_clipboard["items"] = names
+            status_lbl.config(text=f"✂ Cortado: {len(names)} elemento(s). Ve a la carpeta de destino y pulsa Pegar (Ctrl+V).")
+
+        def paste_action():
+            # 1. Comprobar si hay archivos en el portapapeles de Windows (Ctrl+C en el explorador de Windows)
+            win_files = _get_windows_clipboard_files()
+            if win_files:
+                status_lbl.config(text=f"📋 Pegando {len(win_files)} archivo(s) desde el Portapapeles de Windows...")
+                upload_specific_files(win_files)
+                return
+
+            # 2. Comprobar si hay elementos copiados/cortados dentro del dispositivo Android
+            items = device_clipboard.get("items", [])
+            action = device_clipboard.get("action", "")
+            src_dir = device_clipboard.get("source_dir", "")
+            dest_dir = path_var.get().rstrip("/")
+
+            if not items or not action or not src_dir:
+                messagebox.showinfo("Portapapeles Vacío",
+                                    "No hay archivos en el portapapeles.\nPuedes copiar archivos en Windows (Ctrl+C) y pegarlos aquí,\no seleccionar archivos del dispositivo y usar Copiar/Cortar.",
+                                    parent=dialog)
+                return
+
+            verb = "Copiando" if action == "copy" else "Moviendo"
+            status_lbl.config(text=f"{verb} {len(items)} elemento(s) a {dest_dir}...")
+
+            def _paste_worker():
+                for it_name in items:
+                    src_full = f"{src_dir}/{it_name}"
+                    dest_full = f"{dest_dir}/{it_name}"
+                    if action == "copy":
+                        subprocess.run(["adb", "-s", str(target), "shell", f'cp -r "{src_full}" "{dest_full}"'],
+                                       capture_output=True, text=True, creationflags=cflags, timeout=30)
+                    elif action == "cut":
+                        subprocess.run(["adb", "-s", str(target), "shell", f'mv "{src_full}" "{dest_full}"'],
+                                       capture_output=True, text=True, creationflags=cflags, timeout=10)
+
+                if action == "cut":
+                    device_clipboard["items"] = []
+                    device_clipboard["action"] = ""
+
+                dialog.after(0, lambda: [status_lbl.config(text=f"✔ ¡Pegado completado en {dest_dir}!"), load_directory(dest_dir)])
+
+            threading.Thread(target=_paste_worker, daemon=True).start()
+
+        def rename_selected():
+            sel = tree.selection()
+            if not sel:
+                return
+            old_name = tree.item(sel[0], "values")[1]
+            new_name = simpledialog.askstring("Renombrar", f"Nuevo nombre para '{old_name}':",
+                                              initialvalue=old_name, parent=dialog)
+            if not new_name or not new_name.strip() or new_name.strip() == old_name:
+                return
+
+            clean_name = new_name.strip().replace('"', "")
+            curr_dir = path_var.get().rstrip("/")
+            src_full = f"{curr_dir}/{old_name}"
+            dest_full = f"{curr_dir}/{clean_name}"
+
+            try:
+                subprocess.run(["adb", "-s", str(target), "shell", f'mv "{src_full}" "{dest_full}"'],
+                               capture_output=True, text=True, creationflags=cflags, timeout=5)
+                load_directory(path_var.get())
+            except Exception as ex:
+                messagebox.showerror("Error", f"No se pudo renombrar: {ex}", parent=dialog)
+
+        def create_folder():
+            name = simpledialog.askstring("Nueva Carpeta", "Ingresa el nombre de la nueva carpeta:", parent=dialog)
+            if not name or not name.strip():
+                return
+            clean_name = name.strip().replace('"', "")
+            curr_dir = path_var.get().rstrip("/")
+            new_full = f"{curr_dir}/{clean_name}"
+            status_lbl.config(text=f"Creando carpeta {clean_name}...")
+            try:
+                subprocess.run(["adb", "-s", str(target), "shell", f'mkdir -p "{new_full}"'],
+                               capture_output=True, text=True, creationflags=cflags, timeout=5)
+                load_directory(path_var.get())
+            except Exception as ex:
+                messagebox.showerror("Error", f"No se pudo crear la carpeta: {ex}", parent=dialog)
+
+        def delete_selected():
+            sel = tree.selection()
+            if not sel:
+                messagebox.showinfo("Selecciona elemento(s)", "Selecciona uno o más archivos o carpetas para eliminar.", parent=dialog)
+                return
+            names = [tree.item(s, "values")[1] for s in sel]
+            msg = f"¿Estás seguro de que deseas eliminar permanentemente '{names[0]}'?" if len(names) == 1 else f"¿Estás seguro de que deseas eliminar permanentemente {len(names)} elementos seleccionados?"
+            if not messagebox.askyesno("Confirmar Eliminación", msg, parent=dialog):
+                return
+            curr_dir = path_var.get().rstrip("/")
+            status_lbl.config(text=f"Eliminando {len(names)} elemento(s)...")
+
+            def _del_worker():
+                for it_name in names:
+                    full_p = f"{curr_dir}/{it_name}"
+                    try:
+                        subprocess.run(["adb", "-s", str(target), "shell", f'rm -rf "{full_p}"'],
+                                       capture_output=True, text=True, creationflags=cflags, timeout=8)
+                    except Exception:
+                        pass
+                dialog.after(0, lambda: load_directory(curr_dir))
+
+            threading.Thread(target=_del_worker, daemon=True).start()
+
+        # ----------------------------------------------------------------------
+        # MENÚ CONTEXTUAL DE CLIC DERECHO
+        # ----------------------------------------------------------------------
+        def show_context_menu(event):
+            row_id = tree.identify_row(event.y)
+            if row_id:
+                if row_id not in tree.selection():
+                    tree.selection_set(row_id)
+
+            sel = tree.selection()
+            menu = tk.Menu(dialog, tearoff=0)
+
+            can_paste = bool(_get_windows_clipboard_files() or device_clipboard.get("items"))
+
+            if sel:
+                menu.add_command(label="📋 Copiar (Ctrl+C)", command=copy_selection)
+                menu.add_command(label="✂ Cortar (Ctrl+X)", command=cut_selection)
+                menu.add_command(label="📋 Pegar (Ctrl+V)", command=paste_action,
+                                 state=tk.NORMAL if can_paste else tk.DISABLED)
+                menu.add_separator()
+                menu.add_command(label="📥 Descargar a la PC...", command=download_selected)
+                if len(sel) == 1:
+                    menu.add_command(label="✏ Renombrar... (F2)", command=rename_selected)
+                menu.add_command(label="🗑 Eliminar (Supr)", command=delete_selected)
+            else:
+                menu.add_command(label="📋 Pegar (Ctrl+V)", command=paste_action,
+                                 state=tk.NORMAL if can_paste else tk.DISABLED)
+                menu.add_separator()
+                menu.add_command(label="➕ Nueva Carpeta...", command=create_folder)
+                menu.add_command(label="🔄 Refrescar (F5)", command=lambda: load_directory(path_var.get()))
+
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+
+        tree.bind("<Button-3>", show_context_menu)
+
+        # Atajos de teclado en el explorador
+        dialog.bind("<Control-c>", lambda e: copy_selection())
+        dialog.bind("<Control-C>", lambda e: copy_selection())
+        dialog.bind("<Control-x>", lambda e: cut_selection())
+        dialog.bind("<Control-X>", lambda e: cut_selection())
+        dialog.bind("<Control-v>", lambda e: paste_action())
+        dialog.bind("<Control-V>", lambda e: paste_action())
+        dialog.bind("<Delete>", lambda e: delete_selected())
+        dialog.bind("<F2>", lambda e: rename_selected())
+        dialog.bind("<F5>", lambda e: load_directory(path_var.get()))
+
+        # ----------------------------------------------------------------------
+        # BARRA DE ACCIONES INFERIOR
+        # ----------------------------------------------------------------------
+        act_frame = ttk.Frame(dialog, padding=(10, 6, 10, 8))
+        act_frame.pack(fill=tk.X, side=tk.BOTTOM)
+
+        ttk.Button(act_frame, text="📤 Subir Archivo(s)", command=upload_files).pack(side=tk.LEFT, padx=3)
+        ttk.Button(act_frame, text="📁 Subir Carpeta", command=upload_folder).pack(side=tk.LEFT, padx=3)
+        ttk.Button(act_frame, text="📥 Descargar a la PC", command=download_selected).pack(side=tk.LEFT, padx=3)
+        ttk.Button(act_frame, text="➕ Nueva Carpeta", command=create_folder).pack(side=tk.LEFT, padx=3)
+        ttk.Button(act_frame, text="✏ Renombrar", command=rename_selected).pack(side=tk.LEFT, padx=3)
+        ttk.Button(act_frame, text="🗑 Eliminar", command=delete_selected).pack(side=tk.LEFT, padx=3)
+
+        ttk.Button(act_frame, text="Cerrar", command=dialog.destroy).pack(side=tk.RIGHT, padx=4)
+
+        # Cargar directorio inicial
+        load_directory("/sdcard/")
+
+
+    def open_qr_pairing_dialog(self):
+        """Abre directamente el diálogo de vinculación por código QR desde la barra de herramientas."""
+        self.prompt_custom_port(dev=None)
+
+    def prompt_custom_port(self, dev=None):
+        """Abre un diálogo modal para vincular con Código QR o 6 dígitos en una sola pestaña, y conectar por puerto."""
+        if dev is None:
+            dev = {"name": "Nuevo Dispositivo", "ip": "", "key": "", "port": ""}
+
+        name = dev.get("name", "Dispositivo")
+        ip = dev.get("ip", "")
+        pc_ip = getattr(self, "local_ip", None) or get_local_ip()
+        current_port = str(dev.get("port") or dev.get("last_port") or "")
+        if current_port in ("5555", "None"):
+            current_port = ""
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"Depuración Inalámbrica - {name}")
+        dialog.geometry("690x560")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        try:
+            x = self.root.winfo_x() + (self.root.winfo_width() // 2) - 345
+            y = self.root.winfo_y() + (self.root.winfo_height() // 2) - 280
+            dialog.geometry(f"+{x}+{y}")
+        except Exception:
+            pass
+
+        main_f = ttk.Frame(dialog, padding=12)
+        main_f.pack(fill=tk.BOTH, expand=True)
+
+        header_title = f"Configurar Conexión: {name}" if ip else "Vincular Dispositivo Android por Wi-Fi"
+        ttk.Label(main_f, text=header_title, font=("Segoe UI", 11, "bold")).pack(anchor=tk.W, pady=(0, 2))
+        if ip:
+            ttk.Label(main_f, text=f"IP del equipo: {ip} | Red Actual: {self.current_net_name}", font=("Consolas", 9), foreground="#0066cc").pack(anchor=tk.W, pady=(0, 6))
+        else:
+            ttk.Label(main_f, text=f"Red Actual: {self.current_net_name} (IP de esta PC: {pc_ip})", font=("Segoe UI", 9), foreground="#0066cc").pack(anchor=tk.W, pady=(0, 6))
+
+        notebook = ttk.Notebook(main_f)
+        notebook.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
+
+        # Variables de control para la sesión QR
+        stop_qr_event = threading.Event()
+        current_zeroconf = [None]
+
+        def stop_qr_session():
+            stop_qr_event.set()
+            if current_zeroconf[0]:
+                try:
+                    current_zeroconf[0].close()
+                except Exception:
+                    pass
+                current_zeroconf[0] = None
+
+        def on_dialog_close():
+            stop_qr_session()
+            dialog.destroy()
+
+        dialog.protocol("WM_DELETE_WINDOW", on_dialog_close)
+        dialog.bind("<Escape>", lambda e: on_dialog_close())
+
+        # ======================================================================
+        # PESTAÑA 1: VINCULAR DISPOSITIVO (CÓDIGO QR Y MANUAL 6 DÍGITOS JUNTOS)
+        # ======================================================================
+        tab_pair_all = ttk.Frame(notebook, padding=10)
+        notebook.add(tab_pair_all, text="  🔗 Vincular Dispositivo (QR o Código)  ")
+
+        content_cols = ttk.Frame(tab_pair_all)
+        content_cols.pack(fill=tk.BOTH, expand=True)
+
+        # --- Columna Izquierda: Código QR Automático ---
+        col_left = ttk.LabelFrame(content_cols, text=" Opción A: Código QR (Automático) ", padding=8)
+        col_left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
+
+        ttk.Label(
+            col_left,
+            text="1. En el teléfono: Opciones de desarrollador\n   -> Depuración inalámbrica.\n2. Toca 'Vincular disp. mediante código QR'.\n3. Apunta la cámara hacia este código:",
+            font=("Segoe UI", 8),
+            justify=tk.LEFT
+        ).pack(anchor=tk.W, pady=(0, 4))
+
+        qr_box = ttk.Frame(col_left, relief=tk.SOLID, borderwidth=1, padding=2)
+        qr_box.pack(pady=2)
+        qr_lbl = ttk.Label(qr_box)
+        qr_lbl.pack()
+
+        qr_status_lbl = ttk.Label(
+            col_left,
+            text="⏳ Esperando escaneo con la cámara...",
+            font=("Segoe UI", 8, "bold"),
+            foreground="#0066cc",
+            wraplength=230,
+            justify=tk.CENTER
+        )
+        qr_status_lbl.pack(pady=(4, 4))
+
+        btn_regen = ttk.Button(col_left, text="🔄 Generar nuevo QR", command=lambda: start_qr_session())
+        btn_regen.pack(pady=(2, 0))
+
+        # --- Columna Derecha: Vinculación Manual (6 Dígitos) ---
+        col_right = ttk.LabelFrame(content_cols, text=" Opción B: Código de 6 Dígitos (Manual) ", padding=8)
+        col_right.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(5, 0))
+
+        ttk.Label(
+            col_right,
+            text="1. En 'Depuración inalámbrica', toca:\n   'Vincular con un código de vinculación'.\n2. Ingresa los datos que muestra el teléfono:",
+            font=("Segoe UI", 8),
+            justify=tk.LEFT
+        ).pack(anchor=tk.W, pady=(0, 6))
+
+        grid_f = ttk.Frame(col_right)
+        grid_f.pack(fill=tk.X, pady=(2, 8))
+
+        row_idx = 0
+        ip_manual_entry = None
+        if not ip:
+            ttk.Label(grid_f, text="IP del teléfono:", font=("Segoe UI", 8)).grid(row=row_idx, column=0, sticky=tk.W, pady=3)
+            ip_manual_entry = ttk.Entry(grid_f, width=14, font=("Consolas", 9))
+            ip_manual_entry.grid(row=row_idx, column=1, sticky=tk.W, padx=6, pady=3)
+            # Prellenar con la IP móvil detectada si existe
+            for r_k, r_info in self.device_rows.items():
+                r_dev = r_info.get("dev", {})
+                r_ip = r_dev.get("ip", "")
+                if r_ip and r_ip != pc_ip and not r_dev.get("is_router") and not r_dev.get("is_local_or_router"):
+                    ip_manual_entry.insert(0, r_ip)
+                    break
+            row_idx += 1
+
+        ttk.Label(grid_f, text="Puerto de vinculación:", font=("Segoe UI", 8)).grid(row=row_idx, column=0, sticky=tk.W, pady=3)
+        pair_port_entry = ttk.Entry(grid_f, width=14, font=("Consolas", 9))
+        pair_port_entry.grid(row=row_idx, column=1, sticky=tk.W, padx=6, pady=3)
+        # Autocompletar puerto si ya está expuesto en la red
+        try:
+            t_ip = ip or (ip_manual_entry.get().strip() if ip_manual_entry else "192.168.1.5")
+            found_p = check_tcp_ports_fast(t_ip, [45765, 37123, 41187, 39541, 43211, 38125], timeout=0.15)
+            if found_p:
+                pair_port_entry.insert(0, str(found_p[0]))
+        except Exception:
+            pass
+        row_idx += 1
+
+        ttk.Label(grid_f, text="Código (6 dígitos):", font=("Segoe UI", 8)).grid(row=row_idx, column=0, sticky=tk.W, pady=3)
+        pair_code_entry = ttk.Entry(grid_f, width=14, font=("Consolas", 9))
+        pair_code_entry.grid(row=row_idx, column=1, sticky=tk.W, padx=6, pady=3)
+        row_idx += 1
+
+        ttk.Label(grid_f, text="Puerto de conexión:", font=("Segoe UI", 8)).grid(row=row_idx, column=0, sticky=tk.W, pady=3)
+        final_port_entry = ttk.Entry(grid_f, width=14, font=("Consolas", 9))
+        final_port_entry.grid(row=row_idx, column=1, sticky=tk.W, padx=6, pady=3)
+        if current_port:
+            final_port_entry.insert(0, current_port)
+
+        def on_confirm_pair(event=None):
+            target_ip = ip or (ip_manual_entry.get().strip() if ip_manual_entry else "")
+            p_port = pair_port_entry.get().strip()
+            p_code = pair_code_entry.get().strip()
+            c_port = final_port_entry.get().strip()
+
+            if not target_ip:
+                messagebox.showerror("Error", "Ingresa la dirección IP del teléfono.", parent=dialog)
+                return
+            if not p_port.isdigit() or not (1 <= int(p_port) <= 65535):
+                messagebox.showerror("Error", "Ingresa el puerto de vinculación (el que sale en la ventana emergente con el código).", parent=dialog)
+                return
+            if not p_code or len(p_code) < 6:
+                messagebox.showerror("Error", "Ingresa el código de 6 dígitos que muestra el dispositivo.", parent=dialog)
+                return
+            if not c_port.isdigit() or not (1 <= int(c_port) <= 65535):
+                messagebox.showerror("Error", "Ingresa el puerto de conexión (el que se muestra en 'Dirección IP y puerto' en la pantalla principal).", parent=dialog)
+                return
+
+            on_dialog_close()
+            target_dev = dict(dev)
+            target_dev["ip"] = target_ip
+            self._apply_pair_and_connect(target_dev, p_port, p_code, c_port)
+
+        btn_manual = ttk.Button(col_right, text="✔ Vincular y Conectar", command=on_confirm_pair)
+        btn_manual.pack(anchor=tk.E, pady=(10, 0))
+
+        # --- Lógica de la Sesión QR ---
+        def start_qr_session():
+            stop_qr_session()
+            stop_qr_event.clear()
+
+            srv_num = random.randint(100000, 999999)
+            srv_name = f"studio-{srv_num}"
+            pwd = f"{random.randint(100000, 999999)}"
+            payload = f"WIFI:T:ADB;S:{srv_name};P:{pwd};;"
+
+            qr = qrcode.QRCode(
+                version=1,
+                error_correction=qrcode.constants.ERROR_CORRECT_L,
+                box_size=4,
+                border=2,
+            )
+            qr.add_data(payload)
+            qr.make(fit=True)
+            pil_img = qr.make_image(fill_color="black", back_color="white")
+            tk_img = ImageTk.PhotoImage(pil_img)
+            qr_lbl.config(image=tk_img)
+            qr_lbl.image = tk_img
+            qr_status_lbl.config(
+                text="⏳ Esperando escaneo con la cámara del teléfono...",
+                foreground="#0066cc"
+            )
+
+            threading.Thread(target=_qr_worker, args=(srv_name, pwd), daemon=True).start()
+
+        def _qr_worker(srv_name, pwd):
+            cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            target_ip = dev.get("ip", "") if dev else ""
+            subnet_prefix = ".".join(pc_ip.split(".")[:3]) + "." if pc_ip else "192.168.1."
+            already_paired = [False]
+
+            class PairingListener:
+                def __init__(self):
+                    self.ip = None
+                    self.port = None
+
+                def _resolve(self, zc, type_, name):
+                    try:
+                        info = zc.get_service_info(type_, name, timeout=2500)
+                        if info:
+                            addresses = info.parsed_addresses()
+                            if addresses:
+                                ip_found = addresses[0]
+                                is_match = (
+                                    srv_name.lower() in name.lower()
+                                    or (target_ip and ip_found == target_ip)
+                                    or ip_found.startswith(subnet_prefix)
+                                )
+                                if is_match and not self.ip:
+                                    self.ip = ip_found
+                                    self.port = info.port
+                    except Exception:
+                        pass
+
+                def add_service(self, zc, type_, name):
+                    threading.Thread(target=self._resolve, args=(zc, type_, name), daemon=True).start()
+
+                def update_service(self, zc, type_, name):
+                    threading.Thread(target=self._resolve, args=(zc, type_, name), daemon=True).start()
+
+                def remove_service(self, zc, type_, name):
+                    pass
+
+            try:
+                zc = Zeroconf()
+            except Exception:
+                zc = None
+
+            current_zeroconf[0] = zc
+            listener = PairingListener()
+            if zc:
+                try:
+                    ServiceBrowser(zc, "_adb-tls-pairing._tcp.local.", listener)
+                except Exception:
+                    pass
+
+            # Lista de IPs candidatas de la red por si el router bloquea mDNS
+            candidate_ips = []
+            if target_ip:
+                candidate_ips.append(target_ip)
+            for prio_ip in ["192.168.1.5", "192.168.1.78", "192.168.1.77"]:
+                if prio_ip not in candidate_ips and prio_ip != pc_ip:
+                    candidate_ips.append(prio_ip)
+            for r_k, r_info in list(self.device_rows.items()):
+                r_dev = r_info.get("dev", {})
+                r_ip = r_dev.get("ip", "")
+                if r_ip and r_ip != pc_ip and not r_dev.get("is_router") and not r_dev.get("is_local_or_router"):
+                    if r_ip not in candidate_ips:
+                        candidate_ips.append(r_ip)
+
+            def _scan_ephemeral_ports(ip_addr, port_range=range(30000, 52000), timeout_s=0.03):
+                open_ports = []
+                def _chk(p):
+                    if stop_qr_event.is_set() or listener.ip:
+                        return None
+                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    s.settimeout(timeout_s)
+                    try:
+                        if s.connect_ex((ip_addr, p)) == 0:
+                            return p
+                    except Exception:
+                        pass
+                    finally:
+                        try:
+                            s.close()
+                        except Exception:
+                            pass
+                    return None
+
+                with concurrent.futures.ThreadPoolExecutor(max_workers=600) as ex:
+                    for res_p in ex.map(_chk, port_range):
+                        if res_p:
+                            open_ports.append(res_p)
+                return open_ports
+
+            failed_pair_ports = set()
+            start_t = time.time()
+
+            while not stop_qr_event.is_set() and listener.ip is None and (time.time() - start_t) < 90:
+                # Sondeo activo ultrarrápido de puertos dinámicos (30000-52000) para garantizar detección sin depender de mDNS
+                for c_ip in candidate_ips:
+                    if stop_qr_event.is_set() or listener.ip:
+                        break
+                    # Verificar primero si la IP responde o está activa
+                    open_p_list = _scan_ephemeral_ports(c_ip, range(30000, 52000), timeout_s=0.025)
+                    for p_cand in open_p_list:
+                        if stop_qr_event.is_set() or listener.ip:
+                            break
+                        if (c_ip, p_cand) in failed_pair_ports:
+                            continue
+                        try:
+                            self.post_gui(lambda ip_=c_ip, pt_=p_cand: qr_status_lbl.config(
+                                text=f"🔄 Puerto detectado ({ip_}:{pt_})! Vinculando...",
+                                foreground="#b36b00"
+                            ))
+                            pair_try = subprocess.run(
+                                ["adb", "pair", f"{c_ip}:{p_cand}", pwd],
+                                capture_output=True, text=True, creationflags=cflags, timeout=30
+                            )
+                            out_str = (pair_try.stdout + pair_try.stderr).lower()
+                            if "successfully paired" in out_str or pair_try.returncode == 0:
+                                listener.ip = c_ip
+                                listener.port = p_cand
+                                already_paired[0] = True
+                                break
+                            else:
+                                failed_pair_ports.add((c_ip, p_cand))
+                        except Exception:
+                            failed_pair_ports.add((c_ip, p_cand))
+                if not listener.ip:
+                    time.sleep(0.2)
+
+            if stop_qr_event.is_set():
+                if zc:
+                    try:
+                        zc.close()
+                    except Exception:
+                        pass
+                return
+
+            if not listener.ip or not listener.port:
+                self.post_gui(lambda: qr_status_lbl.config(
+                    text="⚠ Tiempo agotado. Pulsa 'Generar nuevo QR' o usa la Opción B de la derecha.",
+                    foreground="#cc3300"
+                ))
+                if zc:
+                    try:
+                        zc.close()
+                    except Exception:
+                        pass
+                return
+
+            pair_ip = listener.ip
+            pair_port = listener.port
+
+            if not already_paired[0]:
+                self.post_gui(lambda: qr_status_lbl.config(
+                    text=f"🔄 ¡Detectado ({pair_ip}:{pair_port})! Vinculando de inmediato...",
+                    foreground="#b36b00"
+                ))
+                pair_ep = f"{pair_ip}:{pair_port}"
+                res = subprocess.run(["adb", "pair", pair_ep, pwd], capture_output=True, text=True, creationflags=cflags, timeout=10)
+                pair_out = (res.stdout + res.stderr).strip()
+
+                if "successfully paired" not in pair_out.lower() and res.returncode != 0:
+                    self.post_gui(lambda: qr_status_lbl.config(
+                        text=f"❌ Error al vincular: {pair_out}",
+                        foreground="#cc0000"
+                    ))
+                    if zc:
+                        try:
+                            zc.close()
+                        except Exception:
+                            pass
+                    return
+
+            self.post_gui(lambda: qr_status_lbl.config(
+                text="✔ ¡Vinculado con éxito! Buscando puerto de conexión...",
+                foreground="#196f3d"
+            ))
+
+            class ConnectListener:
+                def __init__(self, t_ip):
+                    self.target_ip = t_ip
+                    self.port = None
+
+                def _resolve(self, zc_inst, type_, name):
+                    try:
+                        info = zc_inst.get_service_info(type_, name, timeout=2000)
+                        if info:
+                            addresses = info.parsed_addresses()
+                            if addresses and addresses[0] == self.target_ip:
+                                self.port = info.port
+                    except Exception:
+                        pass
+
+                def add_service(self, zc_inst, type_, name):
+                    threading.Thread(target=self._resolve, args=(zc_inst, type_, name), daemon=True).start()
+
+                def update_service(self, zc_inst, type_, name):
+                    threading.Thread(target=self._resolve, args=(zc_inst, type_, name), daemon=True).start()
+
+                def remove_service(self, zc_inst, type_, name):
+                    pass
+
+            c_listener = ConnectListener(pair_ip)
+            if zc:
+                try:
+                    ServiceBrowser(zc, "_adb-tls-connect._tcp.local.", c_listener)
+                except Exception:
+                    pass
+
+            # Esperar brevemente mDNS o escanear activamente el puerto de conexión en pair_ip
+            c_start = time.time()
+            connect_port = None
+            while not stop_qr_event.is_set() and not connect_port and (time.time() - c_start) < 12:
+                if c_listener.port:
+                    connect_port = c_listener.port
+                    break
+                open_conn_ports = _scan_ephemeral_ports(pair_ip, range(30000, 52000), timeout_s=0.025)
+                for cp in open_conn_ports:
+                    if cp != pair_port:
+                        connect_port = cp
+                        break
+                if not connect_port:
+                    time.sleep(0.3)
+
+            if zc:
+                try:
+                    zc.close()
+                except Exception:
+                    pass
+
+            if not connect_port and dev and dev.get("port"):
+                connect_port = int(dev["port"])
+
+            if not connect_port:
+                open_check = check_tcp_ports_fast(pair_ip, [5555, 7888], timeout=1.0)
+                if open_check:
+                    connect_port = int(open_check[0])
+
+            if not connect_port:
+                self.post_gui(lambda: qr_status_lbl.config(
+                    text="✔ ¡Dispositivo vinculado con éxito!\nIngresa el puerto en 'Conectar por Puerto' para finalizar.",
+                    foreground="#196f3d"
+                ))
+                return
+
+            self.post_gui(lambda: qr_status_lbl.config(
+                text=f"🚀 Conectando ADB a {pair_ip}:{connect_port}...",
+                foreground="#196f3d"
+            ))
+
+            conn_res = subprocess.run(["adb", "connect", f"{pair_ip}:{connect_port}"], capture_output=True, text=True, errors="replace", creationflags=cflags, timeout=8)
+            conn_out = (conn_res.stdout + conn_res.stderr).strip()
+
+            if "connected to" in conn_out.lower():
+                self.post_gui(lambda: qr_status_lbl.config(
+                    text=f"🎉 ¡Dispositivo vinculado y conectado exitosamente en {pair_ip}:{connect_port}!",
+                    foreground="#196f3d"
+                ))
+                dev_name = dev.get("name") if dev and dev.get("name") and "dispositivo" not in dev.get("name", "").lower() else f"Android ({pair_ip})"
+                save_known_device(
+                    pair_ip,
+                    name=dev_name,
+                    is_static=True,
+                    last_port=str(connect_port),
+                    network=self.current_net_name
+                )
+                if dev:
+                    dev["port"] = str(connect_port)
+                    dev["last_port"] = str(connect_port)
+                    dev["is_port_open"] = True
+                    dev["is_adb_connected"] = True
+                    self.post_gui(self._update_row_state_by_key, dev.get("key", pair_ip), dev)
+
+                def _auto_close():
+                    try:
+                        dialog.destroy()
+                    except Exception:
+                        pass
+                    self.trigger_scan()
+
+                self.root.after(1200, _auto_close)
+            else:
+                self.post_gui(lambda: qr_status_lbl.config(
+                    text=f"Vinculado con éxito. Error conectando: {conn_out}",
+                    foreground="#cc3300"
+                ))
+
+        # Iniciar sesión QR automáticamente al abrir el diálogo
+        start_qr_session()
+
+        # ======================================================================
+        # PESTAÑA 2: CONECTAR POR PUERTO (EQUIPOS PREVIAMENTE VINCULADOS)
+        # ======================================================================
+        tab_conn = ttk.Frame(notebook, padding=12)
+        notebook.add(tab_conn, text="  ⚡ Conectar por Puerto (Ya Vinculado)  ")
+
+        ttk.Label(
+            tab_conn,
+            text="Usa este modo si el equipo ya está vinculado a esta PC.\nIngresa el puerto que aparece en 'Dirección IP y puerto' del teléfono:",
+            font=("Segoe UI", 9),
+            foreground="#333333"
+        ).pack(anchor=tk.W, pady=(0, 10))
+
+        f_port = ttk.Frame(tab_conn)
+        f_port.pack(fill=tk.X, pady=(0, 15))
+        ttk.Label(f_port, text="Puerto ADB:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT)
+        port_entry = ttk.Entry(f_port, width=12, font=("Consolas", 10))
+        port_entry.pack(side=tk.LEFT, padx=8)
+        if current_port:
+            port_entry.insert(0, current_port)
+            port_entry.select_range(0, tk.END)
+
+        def on_confirm_connect(event=None):
+            val = port_entry.get().strip()
+            if not val or not val.isdigit() or not (1 <= int(val) <= 65535):
+                messagebox.showerror("Puerto Inválido", "Ingresa un número de puerto válido (1 - 65535).", parent=dialog)
+                return
+            on_dialog_close()
+            self._apply_custom_port(dev, val)
+
+        btn_tab2 = ttk.Frame(tab_conn)
+        btn_tab2.pack(fill=tk.X, side=tk.BOTTOM)
+        ttk.Button(btn_tab2, text="Conectar", command=on_confirm_connect).pack(side=tk.LEFT)
+        port_entry.bind("<Return>", on_confirm_connect)
+
+        # Botón general para cerrar
+        btn_bottom_bar = ttk.Frame(main_f)
+        btn_bottom_bar.pack(fill=tk.X, side=tk.BOTTOM, pady=(6, 0))
+        ttk.Button(btn_bottom_bar, text="Cerrar", command=on_dialog_close).pack(side=tk.RIGHT)
+
+    def _apply_pair_and_connect(self, dev, pair_port, pair_code, connect_port):
+        """Ejecuta adb pair y luego adb connect en un hilo en segundo plano."""
+        ip = dev.get("ip", "")
+        name = dev.get("name", "Dispositivo")
+        self.set_status(f"Vinculando {name} ({ip}:{pair_port}) con código {pair_code}...")
+
+        def _worker():
+            cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            pair_target = f"{ip}:{pair_port}"
+            res = subprocess.run(["adb", "pair", pair_target, pair_code], capture_output=True, text=True, creationflags=cflags, timeout=12)
+            pair_out = (res.stdout + res.stderr).strip()
+
+            if "successfully paired" in pair_out.lower() or res.returncode == 0:
+                self.set_status(f"¡Vinculado con éxito a {name}! Conectando...")
+                self._apply_custom_port(dev, connect_port)
+            else:
+                self.set_status(f"Fallo de vinculación: {pair_out}")
+                self.post_gui(
+                    messagebox.showerror,
+                    "Fallo al Vincular",
+                    f"No se pudo vincular con {name} ({pair_target}):\n\n{pair_out}\n\nVerifica que el código y el puerto de vinculación coincidan con la ventana emergente del teléfono."
+                )
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _apply_custom_port(self, dev, port_str):
+        """Aplica el puerto ingresado manualmente y lanza la conexión ADB."""
+        ip = dev.get("ip", "")
+        dev_key = dev.get("key", ip)
+        old_port = dev.get("port")
+
+        dev["port"] = port_str
+        dev["last_port"] = port_str
+        dev["is_port_open"] = True
+
+        if ip and not dev.get("is_usb"):
+            save_known_device(
+                ip,
+                name=dev.get("name"),
+                mac=dev.get("mac", ""),
+                is_static=dev.get("is_static", True),
+                last_port=port_str,
+                network=dev.get("network", self.current_net_name)
+            )
+
+        self._update_row_state_by_key(dev_key, dev)
+
+        # Si ya estaba conectado a otro puerto anterior, desconectar el viejo
+        if old_port and old_port != port_str and ip:
+            cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            try:
+                subprocess.run(["adb", "disconnect", f"{ip}:{old_port}"], capture_output=True, creationflags=cflags, timeout=2)
+            except Exception:
+                pass
+
+        self.connect_single_device(dev)
+
+    def toggle_port_5555(self, dev, open_it=True):
+        """Abre o cierra el puerto 5555 en el dispositivo vía cable USB o comando ADB."""
+        threading.Thread(target=self._toggle_port_worker, args=(dev, open_it), daemon=True).start()
+
+    def _toggle_port_worker(self, dev, open_it=True):
+        cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        name = dev.get("name", "Dispositivo")
+        ip = dev.get("ip", "")
+        dev_key = dev.get("key", ip)
+
+        if open_it:
+            self.set_status(f"Abriendo puerto 5555 en {name} vía USB...")
+            target_serial = None
+            target_status = "device"
+            if dev.get("is_usb"):
+                target_serial = dev.get("serial")
+                target_status = "offline" if dev.get("is_offline") else ("unauthorized" if dev.get("is_unauthorized") else "device")
+            else:
+                try:
+                    res = subprocess.run(["adb", "devices", "-l"], capture_output=True, text=True, errors="replace", creationflags=cflags, timeout=3)
+                    usb_targets = []
+                    for line in res.stdout.splitlines():
+                        parts = line.strip().split()
+                        if len(parts) >= 2:
+                            s = parts[0]
+                            st = parts[1]
+                            if ":" not in s and "_adb-tls" not in s and st in ("device", "offline", "unauthorized"):
+                                model = ""
+                                for p in parts[2:]:
+                                    if p.startswith("model:"):
+                                        model = p.split(":", 1)[1]
+                                if not model and s == "1340003718":
+                                    model = "E700"
+                                elif not model and s.startswith("1070"):
+                                    model = "E800"
+                                usb_targets.append((s, model, st))
+
+                    # 1. Coincidencia específica por serial o IP conocida
+                    row_ip = dev.get("ip", "")
+                    name_lower = name.lower()
+                    for s, m, st in usb_targets:
+                        m_lower = m.lower() if m else ""
+                        if (
+                            (s == "1340003718" and ("e700" in name_lower or "205" in row_ip)) or
+                            (s.startswith("1070") and ("e800" in name_lower or "204" in row_ip)) or
+                            ("e700" in m_lower and "e700" in name_lower) or
+                            ("e800" in m_lower and "e800" in name_lower) or
+                            (m_lower and (m_lower in name_lower or name_lower in m_lower))
+                        ):
+                            target_serial = s
+                            target_status = st
+                            break
+
+                    # 2. Si no hubo coincidencia directa pero hay USBs
+                    if not target_serial and usb_targets:
+                        target_serial = usb_targets[0][0]
+                        target_status = usb_targets[0][2]
+                except Exception:
+                    pass
+
+            if not target_serial:
+                self.set_status(f"No se detectó cable USB para {name}.")
+                self.post_gui(
+                    messagebox.showinfo,
+                    "Conexión por Cable Requerida",
+                    f"Para abrir el puerto 5555 en {name}:\n\n"
+                    f"1. Conecta el cable USB del {name} al PC.\n"
+                    f"2. Toca nuevamente el botón 'Abrir puerto 5555'.\n\n"
+                    f"El bot abrirá el puerto inmediatamente vía cable USB y se conectará automáticamente por Wi-Fi."
+                )
+                return
+
+            if target_status == "unauthorized":
+                self.set_status(f"El dispositivo USB {target_serial} requiere autorización en pantalla.")
+                self.post_gui(
+                    messagebox.showwarning,
+                    "Autorización Requerida en Pantalla",
+                    f"El terminal {name} (USB {target_serial}) está conectado, pero esperando confirmación:\n\n"
+                    f"1. Enciende y desbloquea la pantalla de {name}.\n"
+                    f"2. En el mensaje '¿Permitir depuración por USB?', marca 'Permitir siempre desde esta computadora'.\n"
+                    f"3. Presiona 'Aceptar' y vuelve a tocar 'Abrir puerto 5555'."
+                )
+                return
+
+            self.set_status(f"Activando TCP/IP 5555 en {name} (USB {target_serial})...")
+            net_det = {"wlan_ip": "", "all_ips": [], "model": ""}
+            dev_mac = ""
+            if target_status == "device":
+                net_det = get_usb_device_net_details(target_serial, cflags=cflags)
+                _, dev_mac = get_usb_device_ssid_and_mac(target_serial, cflags=cflags)
+
+            wlan_ip = net_det.get("wlan_ip", "")
+            m_chk = net_det.get("model", "")
+            real_model = (f"PAX {m_chk}" if (m_chk.startswith("E") or m_chk.startswith("A")) else m_chk) if m_chk else ""
+
+            tcpip_ok = prepare_usb_device_for_wifi_adb(target_serial, cflags=cflags, port=5555, force_tcpip=True)
+
+            if not tcpip_ok:
+                self.set_status(f"Dispositivo {name} detectado por USB pero no responde.")
+                self.post_gui(
+                    messagebox.showwarning,
+                    "Terminal USB no Responde (Depuración Desactivada)",
+                    f"Se detectó el cable USB conectado a {name} (Serial: {target_serial}), pero el terminal no responde a los comandos ADB.\n\n"
+                    f"Para habilitarlo en el terminal:\n"
+                    f"1. Enciende y desbloquea la pantalla del equipo.\n"
+                    f"2. Ve a Ajustes -> Opciones de desarrollador.\n"
+                    f"3. Apaga y vuelve a encender 'Depuración por USB'.\n"
+                    f"4. Si aparece '¿Permitir depuración por USB?', marca 'Permitir siempre' y toca ACEPTAR.\n"
+                    f"5. Si sigue sin responder, desconecta el cable USB y vuelve a conectarlo firmemente."
+                )
+                return
+
+            try:
+                target_name = real_model if real_model else dev.get("name", name)
+                fallback_ip = ip if is_valid_lan_ipv4(ip) else ""
+                target_ip = wlan_ip or fallback_ip
+                pc_ip_now = get_wifi_adapter_ip(force=True)
+                wake_device_to_pc_route(target_serial, pc_ip_now, cflags=cflags)
+
+                if dev.get("is_usb"):
+                    dev["wlan_ip"] = target_ip
+                    dev["ip"] = f"USB (IP: {target_ip})" if target_ip else f"USB ({target_serial})"
+                else:
+                    dev["ip"] = target_ip or ip
+                    dev["port"] = "5555"
+                dev["name"] = target_name
+                dev["is_port_open"] = True
+
+                is_wifi_adb_up = False
+                if target_ip:
+                    save_known_device(target_ip, name=target_name, mac=dev_mac, is_static=True, last_port="5555", network=self.current_net_name)
+                    ok_conn, _, _ = connect_adb_endpoint_verified(f"{target_ip}:5555", cflags=cflags, attempts=2)
+                    if ok_conn:
+                        is_wifi_adb_up = True
+                        ensure_device_internet_stability(f"{target_ip}:5555")
+
+                self.set_status(f"¡Puerto 5555 abierto exitosamente en {target_name} ({target_ip or target_serial})!")
+                self.post_gui(self._update_row_state_by_key, dev_key, dev)
+
+                if target_ip and target_ip in self.device_rows:
+                    wifi_row_dev = self.device_rows[target_ip]["dev"]
+                    wifi_row_dev["is_port_open"] = True
+                    wifi_row_dev["port"] = "5555"
+                    wifi_row_dev["name"] = target_name
+                    if is_wifi_adb_up:
+                        wifi_row_dev["is_adb_connected"] = True
+                    self.post_gui(self._update_row_state_by_key, target_ip, wifi_row_dev)
+
+                self.trigger_scan()
+
+                msg_status = (
+                    f"El bot abrió el puerto y lo conectó por Wi-Fi ({target_ip}:5555).\nYa puedes desconectar el cable USB."
+                    if is_wifi_adb_up else
+                    f"El puerto 5555 quedó abierto en {target_name} ({target_ip or 'sin Wi-Fi activo'})."
+                )
+                self.post_gui(messagebox.showinfo, "Puerto 5555 Abierto", f"¡Puerto 5555 abierto en {target_name}!\n\n{msg_status}")
+            except Exception as e:
+                self.set_status(f"Error abriendo puerto 5555: {e}")
+        else:
+            self.set_status(f"Cerrando puerto 5555 en {name}...")
+            try:
+                # 1. Pasar a modo usb y desconectar Wi-Fi
+                if ip:
+                    subprocess.run(["adb", "-s", f"{ip}:5555", "usb"], capture_output=True, creationflags=cflags, timeout=3)
+                    subprocess.run(["adb", "disconnect", f"{ip}:5555"], capture_output=True, creationflags=cflags, timeout=2)
+                    subprocess.run(["adb", "disconnect", ip], capture_output=True, creationflags=cflags, timeout=2)
+
+                # Si hay cable USB conectado para este equipo, también pasar el USB a modo usb
+                target_serial = None
+                if dev.get("is_usb"):
+                    target_serial = dev.get("serial")
+                else:
+                    try:
+                        res = subprocess.run(["adb", "devices", "-l"], capture_output=True, text=True, errors="replace", creationflags=cflags, timeout=3)
+                        for line in res.stdout.splitlines():
+                            parts = line.strip().split()
+                            if len(parts) >= 2 and parts[1] == "device":
+                                s = parts[0]
+                                if ":" not in s and "_adb-tls" not in s:
+                                    model = ""
+                                    for p in parts[2:]:
+                                        if p.startswith("model:"):
+                                            model = p.split(":", 1)[1]
+                                    if model and model.lower() in name.lower():
+                                        target_serial = s
+                                        break
+                    except Exception:
+                        pass
+                if target_serial:
+                    subprocess.run(["adb", "-s", target_serial, "usb"], capture_output=True, creationflags=cflags, timeout=3)
+
+                time.sleep(0.5)
+                open_check = check_tcp_ports_fast(ip, [5555]) if ip else []
+                dev["is_adb_connected"] = False
+                dev["is_port_open"] = bool(open_check)
+                self.set_status(f"Puerto 5555 cerrado en {name}.")
+                self.post_gui(self._update_row_state_by_key, dev_key, dev)
+                self.trigger_scan()
+            except Exception as e:
+                self.set_status(f"Error cerrando puerto 5555: {e}")
+
+    def _auto_open_usb_port(self, serial, model_name):
+        """Control manual mediante botón 'Abrir puerto 5555'."""
+        return
+        cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        try:
+            subprocess.run(["adb", "-s", serial, "tcpip", "5555"], capture_output=True, creationflags=cflags, timeout=5)
+            for prop, val in [
+                ("persist.adb.tcp.port", "5555"),
+                ("persist.service.adb.enable", "5555"),
+                ("persist.sys.enable.tcpip", "true")
+            ]:
+                subprocess.run(["adb", "-s", serial, "shell", "setprop", prop, val], capture_output=True, creationflags=cflags, timeout=1.5)
+
+            # Extraer IP de wlan0 y registrarla
+            wlan_ip = ""
+            try:
+                ip_out = subprocess.run(["adb", "-s", serial, "shell", "ip", "-f", "inet", "addr", "show", "wlan0"], capture_output=True, text=True, errors="replace", creationflags=cflags, timeout=2).stdout
+                m_ip = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+)", ip_out)
+                if m_ip:
+                    wlan_ip = m_ip.group(1)
+                    save_known_device(wlan_ip, name=model_name, is_static=True, last_port="5555", network="Sitio de Trabajo")
+            except Exception:
+                pass
+
+            msg_extra = f" (IP Wi-Fi: {wlan_ip})" if wlan_ip else ""
+            self.set_status(f"¡Cable USB detectado! Puerto 5555 abierto automáticamente en {model_name}{msg_extra}.")
+            time.sleep(1.0)
+            self.trigger_scan()
+        except Exception:
+            pass
+
+    def start_control_session(self, dev, display_id=0, turn_screen_off=None):
+        """Inicia el control remoto en ventana normal (minimizables y maximizables). Conecta por ADB si es necesario."""
+        if turn_screen_off is None:
+            turn_screen_off = bool(getattr(self, "screen_off_var", None) and self.screen_off_var.get())
+
+        serial_target = dev.get("serial")
+        if not serial_target:
+            if dev.get("port"):
+                serial_target = f"{dev['ip']}:{dev['port']}"
+            else:
+                serial_target = dev["ip"]
+
+        resolved = resolve_active_adb_target(serial_target, dev=dev)
+
+        cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        is_already_active = False
+        if dev.get("is_usb") or dev.get("is_adb_connected"):
+            is_already_active = True
+        elif resolved:
+            try:
+                chk = subprocess.run(["adb", "-s", str(resolved), "get-state"], capture_output=True, text=True, creationflags=cflags, timeout=2)
+                if "device" in chk.stdout:
+                    is_already_active = True
+            except Exception:
+                pass
+
+        if is_already_active:
+            launch_remote_control(resolved, display_id=display_id, device_name=dev["name"], dev=dev, turn_screen_off=turn_screen_off)
+            self.root.after(350, self.hide_to_background)
+        else:
+            if not dev.get("is_port_open"):
+                messagebox.showwarning("No Disponible", f"{dev['name']} se encuentra fuera de esta red o no tiene el puerto ADB abierto.")
+                return
+            self.set_status(f"Conectando ADB a {dev['name']} ({dev['ip']})...")
+            threading.Thread(target=self._auto_connect_and_launch, args=(dev, display_id, turn_screen_off), daemon=True).start()
+
+    def _auto_connect_and_launch(self, dev, display_id, turn_screen_off=False):
+        dev_key = dev["key"]
+        ip = dev["ip"]
+        row_info = self.device_rows.get(dev_key)
+        if row_info:
+            self.post_gui(lambda inf=row_info: inf["status_lbl"].config(text="⏳ Conectando...", foreground="#b36b00"))
+        ok, detail, model = connect_ip_automatically(ip, known_port=dev.get("port", ""), status_callback=self.set_status)
+        if ok:
+            ensure_storage_mount()
+            ensure_device_internet_stability(detail)
+            dev["is_adb_connected"] = True
+            dev["serial"] = detail
+            if model:
+                dev["name"] = model
+            self.post_gui(self._update_row_state_by_key, dev_key, dev)
+            resolved = resolve_active_adb_target(detail, dev=dev)
+            self.post_gui(launch_remote_control, resolved, display_id, dev["name"], dev, turn_screen_off)
+            self.root.after(450, self.hide_to_background)
+        else:
+            open_now = check_tcp_ports_fast(ip, [5555, 7888])
+            dev["is_port_open"] = bool(open_now)
+            self.post_gui(self._update_row_state_by_key, dev_key, dev)
+            self.post_gui(messagebox.showwarning, "Error de Conexión", f"No se pudo conectar a {dev['name']}:\n{detail}")
+
+    def apply_filter(self, *args):
+        query = self.filter_var.get().strip().lower()
+        selected_net = self.net_filter_var.get().strip()
+
+        # 1. Desempaquetar todas las filas para refrescar el orden visual
+        for k, info in self.device_rows.items():
+            info["row_frame"].pack_forget()
+
+        # 2. Ordenar las filas:
+        #    - Al principio: Dispositivos en estado Conectado (ADB o USB)
+        #    - Después: Los demás dispositivos
+        #    - Ambos grupos en orden numérico ascendente por dirección IP
+        sorted_items = sorted(
+            self.device_rows.items(),
+            key=lambda it: get_device_sort_key(it[1]["dev"])
+        )
+
+        # 3. Empaquetar en el orden exacto las que cumplan los filtros activos
+        for k, info in sorted_items:
+            dev = info["dev"]
+            name = str(dev.get("name", "")).lower()
+            ip = str(dev.get("ip", "")).lower()
+            dev_net = dev.get("network", "")
+            grp = info.get("group_name", dev_net)
+
+            # Filtro de red
+            net_match = True
+            if selected_net == "Solo Red Actual Conectada":
+                net_match = dev.get("is_on_current_net") or dev.get("is_usb")
+            elif selected_net == "Solo Sitio de Trabajo":
+                net_match = ("trabajo" in str(grp).lower() or "trabajo" in dev_net.lower())
+            elif selected_net == "Solo Casa":
+                net_match = ("casa" in str(grp).lower() or "familia" in str(grp).lower() or "casa" in dev_net.lower() or "familia" in dev_net.lower())
+
+            # Filtro de texto
+            text_match = (not query or query in ip or query in name)
+
+            if net_match and text_match:
+                info["row_frame"].pack(fill=tk.X, expand=True, pady=2)
+
+        self.root.update_idletasks()
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def add_manual_ip(self):
+        raw_ip = self.manual_ip_var.get().strip()
+        if not re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", raw_ip):
+            messagebox.showwarning("IP Inválida", "Por favor ingresa una dirección IPv4 válida (ejemplo: 192.168.1.78).")
+            return
+
+        self.set_status(f"Comprobando IP estática {raw_ip}...")
+        threading.Thread(target=self._add_manual_worker, args=(raw_ip,), daemon=True).start()
+
+    def _add_manual_worker(self, ip):
+        cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        mac = get_mac_sendarp(ip)
+        res = subprocess.run(["ping", "-n", "1", "-w", "400", ip], capture_output=True, text=True, creationflags=cflags)
+        is_alive = ("TTL=" in res.stdout or "ttl=" in res.stdout.lower()) or (mac is not None)
+
+        if not is_alive:
+            self.post_gui(messagebox.showwarning, "Sin Respuesta", f"El equipo {ip} no respondió. Verifica que esté encendido y en la misma red Wi-Fi.")
+            self.set_status(f"Dispositivo {ip} no respondió.")
+            return
+
+        if not mac:
+            arp_out = subprocess.run(["arp", "-a"], capture_output=True, text=True, creationflags=cflags).stdout
+            for line in arp_out.splitlines():
+                if ip in line:
+                    m = re.search(r"([0-9a-fA-F\-]{17})", line)
+                    if m:
+                        mac = m.group(1).upper().replace("-", ":")
+
+        open_p = check_tcp_ports_fast(ip, [5555, 7888])
+        detected_port = open_p[0] if open_p else ""
+        vendor = lookup_mac_vendor_fast(mac) if mac else ""
+        name = f"Dispositivo Estático ({vendor})" if vendor else "Dispositivo IP Estática"
+
+        save_known_device(ip, name=name, mac=mac, is_static=True, last_port=detected_port, network=self.current_net_name)
+        self.post_gui(self.manual_ip_var.set, "")
+        self.set_status(f"¡Dispositivo estático {ip} guardado y confirmado!")
+        self.post_gui(self.trigger_scan)
+
+    def select_mobiles(self):
+        for info in self.device_rows.values():
+            dev = info["dev"]
+            can_con = dev.get("is_port_open") and not dev.get("is_adb_connected") and not dev.get("is_usb") and not dev.get("is_local_or_router") and dev.get("is_on_current_net", True)
+            info["chk_var"].set(bool(can_con))
+
+    def deselect_all(self):
+        for info in self.device_rows.values():
+            info["chk_var"].set(False)
+
+    def connect_selected(self):
+        if self.connecting:
+            return
+        targets = [(k, info) for k, info in self.device_rows.items() if info["chk_var"].get()]
+        if not targets:
+            messagebox.showwarning("Sin selección", "Marca al menos un dispositivo disponible para conectar por ADB.")
+            return
+
+        self.connecting = True
+        self.btn_connect.config(state=tk.DISABLED)
+        threading.Thread(target=self._connect_worker, args=(targets,), daemon=True).start()
+
+    def _connect_worker(self, targets):
+        successes = []
+        failures = []
+
+        for k, info in targets:
+            dev = info["dev"]
+            dev_name = dev["name"]
+            ip = dev["ip"]
+            known_p = dev.get("port", "")
+            self.post_gui(lambda inf=info: inf["status_lbl"].config(text="⏳ Conectando...", foreground="#b36b00"))
+
+            ok, detail, model = connect_ip_automatically(
+                ip,
+                known_port=known_p,
+                status_callback=self.set_status
+            )
+
+            if ok:
+                ensure_storage_mount()
+                ensure_device_internet_stability(detail)
+                dev["is_adb_connected"] = True
+                dev["serial"] = detail
+                if model:
+                    dev["name"] = model
+                self.post_gui(self._update_row_state_by_key, k, dev)
+                successes.append(f"{dev_name} ({detail})")
+            else:
+                open_now = check_tcp_ports_fast(ip, [5555, 7888])
+                dev["is_port_open"] = bool(open_now)
+                self.post_gui(self._update_row_state_by_key, k, dev)
+                failures.append((f"{dev_name} ({ip})", detail))
+
+        self.connecting = False
+        self.post_gui(self.btn_connect.config, state=tk.NORMAL)
+        self.set_status(f"Proceso finalizado -> Conectados: {len(successes)} | No disponibles: {len(failures)}")
+
+        msg = ""
+        if successes:
+            msg += f"Conectados exitosamente ({len(successes)}):\n" + "\n".join(f"  ✔ {s}" for s in successes) + "\n\n"
+        if failures:
+            msg += f"No se pudo conectar a ({len(failures)}):\n" + "\n".join(
+                f"  ✖ {title}:\n    {reason}"
+                for title, reason in failures
+            )
+
+        self.post_gui(messagebox.showinfo, "Resultado de Conexión ADB", msg)
+
+    def disconnect_all(self):
+        cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        subprocess.run(["adb", "disconnect"], capture_output=True, creationflags=cflags, timeout=3)
+        for k, info in self.device_rows.items():
+            if not info["dev"]["is_local_or_router"]:
+                info["dev"]["is_adb_connected"] = False
+                ip = info["dev"]["ip"]
+                if not info["dev"].get("is_usb"):
+                    open_p = check_tcp_ports_fast(ip, [5555, 7888])
+                    info["dev"]["is_port_open"] = bool(open_p)
+                self._update_row_state_by_key(k, info["dev"])
+        self.status_var.set("Todos los dispositivos ADB Wi-Fi han sido desconectados.")
+        messagebox.showinfo("Desconectado", "Se han cerrado todas las conexiones ADB por Wi-Fi.")
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = RealTimeMultiADBApp(root)
+    root.mainloop()

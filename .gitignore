@@ -1,0 +1,13 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Known devices local cache if private (or keep if desired)
+# known_devices.json
+
+# Logs
+*.log
+
+# Scrcpy temporary dumps
+*.dump

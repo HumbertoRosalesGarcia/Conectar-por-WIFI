@@ -1,0 +1,310 @@
+{
+  "192.168.1.204": {
+    "name": "PAX E800",
+    "mac": "C0:84:7D:A6:B1:2C",
+    "last_port": "5555",
+    "is_static": true,
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.205": {
+    "name": "PAX E700",
+    "mac": "CC:4B:73:AA:9B:E6",
+    "last_port": "5555",
+    "is_static": true,
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.201": {
+    "name": "PAX A80",
+    "mac": "70:3E:97:7C:3E:4A",
+    "last_port": "5555",
+    "is_static": true,
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.200": {
+    "name": "A920Pro",
+    "mac": "F4:02:23:24:4B:E0",
+    "last_port": "5555",
+    "is_static": true,
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.203": {
+    "name": "SM_T307U",
+    "mac": "46:F3:D3:0D:1C:9F",
+    "last_port": "45717",
+    "is_static": true,
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.78": {
+    "name": "C20DS",
+    "mac": "DC:2E:97:20:F5:8B",
+    "last_port": "41407",
+    "is_static": true,
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.211": {
+    "name": "Epson Printer",
+    "mac": "9C:AE:D3:87:17:EC",
+    "is_static": true,
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.1": {
+    "name": "Router Wi-Fi",
+    "mac": "08:33:ED:6F:A3:10",
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.79": {
+    "name": "SM_T307U",
+    "mac": "80:20:FD:9A:41:08",
+    "last_port": "35253",
+    "is_static": true,
+    "network": "Casa (Familia Rosales Martinez)"
+  },
+  "192.168.1.3": {
+    "name": "Google Device",
+    "mac": "24:62:AB:58:5E:89",
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.16": {
+    "name": "TP-Link",
+    "mac": "E0:98:06:D6:24:61",
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.17": {
+    "name": "TP-Link",
+    "mac": "24:62:AB:58:4B:2B",
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.18": {
+    "name": "TP-Link",
+    "mac": "24:62:AB:58:57:14",
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.22": {
+    "name": "Midea AC",
+    "mac": "24:6A:0E:2F:BD:EE",
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.23": {
+    "name": "Google Home / Cast",
+    "mac": "4A:9D:B2:5B:A2:39",
+    "network": "Casa (Familia Rosales Martinez)"
+  },
+  "192.168.1.26": {
+    "name": "Dispositivo Móvil Wi-Fi (MAC Privada)",
+    "mac": "86:16:79:A4:A4:4C",
+    "network": "Sitio de Trabajo",
+    "last_port": "40143"
+  },
+  "192.168.1.9": {
+    "name": "Espressif Inc.",
+    "mac": "1C:1A:1B:E7:C4:59",
+    "network": "Sitio de Trabajo",
+    "last_port": "40493"
+  },
+  "192.168.1.30": {
+    "name": "Dispositivo en Red Wi-Fi",
+    "mac": "F4:DD:06:BF:5E:96",
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.254": {
+    "name": "Dispositivo en Red Wi-Fi",
+    "mac": "00:E0:4C:FB:EC:A3",
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.34": {
+    "name": "PAX E800",
+    "mac": "C0:84:7D:A6:B1:2C",
+    "network": "Sitio de Trabajo",
+    "last_port": "5555",
+    "is_static": true
+  },
+  "192.168.1.5": {
+    "name": "Dispositivo Móvil Wi-Fi (MAC Privada)",
+    "mac": "B4:B0:24:D0:C4:93",
+    "network": "Sitio de Trabajo"
+  },
+  "127.0.0.1": {
+    "name": "SM_A805N",
+    "mac": "",
+    "last_port": "5555",
+    "network": "Casa (Familia Rosales Martinez)"
+  },
+  "192.168.1.2": {
+    "name": "Espressif Inc.",
+    "mac": "68:3A:48:E8:25:16",
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.6": {
+    "name": "Dispositivo en Red Wi-Fi",
+    "mac": "B4:B0:24:D0:CB:16",
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.7": {
+    "name": "Espressif Inc.",
+    "mac": "B4:B0:24:D0:C4:97",
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.8": {
+    "name": "Espressif Inc.",
+    "mac": "B0:2A:43:0D:27:E0",
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.10": {
+    "name": "Espressif Inc.",
+    "mac": "2C:F4:32:BF:66:BC",
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.15": {
+    "name": "Espressif Inc.",
+    "mac": "24:62:AB:58:55:CB",
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.20": {
+    "name": "Espressif Inc.",
+    "mac": "24:62:AB:58:4B:2B",
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.24": {
+    "name": "Dispositivo en Red Wi-Fi",
+    "mac": "8E:F4:6F:06:DF:69",
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.25": {
+    "name": "Dispositivo en Red Wi-Fi",
+    "mac": "46:17:90:73:63:EB",
+    "network": "Sitio de Trabajo",
+    "last_port": "39680"
+  },
+  "192.168.1.28": {
+    "name": "Google Device",
+    "mac": "1E:C0:BD:65:DC:B6",
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.29": {
+    "name": "Android (adb-R52N40YGEFF-HViMpk)",
+    "mac": "2C:F4:32:04:08:CD",
+    "last_port": "45260",
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.33": {
+    "name": "Android (adb-DE10258111000-d97AwQ)",
+    "mac": "46:17:90:73:63:EB",
+    "last_port": "32925",
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.39": {
+    "name": "Dispositivo Móvil Wi-Fi (MAC Privada)",
+    "mac": "1E:C0:BD:65:DC:B6",
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.207": {
+    "name": "HumberPC (Este PC)",
+    "mac": "Local",
+    "network": "Sitio de Trabajo",
+    "last_port": "5555"
+  },
+  "192.168.1.240": {
+    "name": "Dispositivo en Red Wi-Fi",
+    "mac": "AC:B9:2F:10:8C:4E",
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.38": {
+    "name": "Espressif Inc.",
+    "mac": "2C:F4:32:04:08:CD",
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.40": {
+    "name": "Dispositivo en Red Wi-Fi",
+    "mac": "F4:DD:06:BF:5E:96",
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.12": {
+    "name": "Midea AC",
+    "mac": "D4:F5:47:57:1B:EF",
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.31": {
+    "name": "Android (adb-DE10258111000-d97AwQ)",
+    "mac": "8E:F4:6F:06:DF:69",
+    "last_port": "39965",
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.32": {
+    "name": "Android (adb-DP05253T10183-QIy5c9)",
+    "mac": "86:16:79:A4:A4:4C",
+    "last_port": "39997",
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.77": {
+    "name": "Dispositivo IP Estática",
+    "mac": "A8:2B:D5:ED:04:00",
+    "is_static": true,
+    "network": "Casa (Familia Rosales Martinez)"
+  },
+  "192.168.1.4": {
+    "name": "Espressif Inc.",
+    "mac": "24:62:AB:58:51:5A",
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.11": {
+    "name": "Espressif Inc.",
+    "mac": "E4:C3:2A:81:DD:64",
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.13": {
+    "name": "Espressif Inc.",
+    "mac": "F4:DD:06:BF:5E:96",
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.14": {
+    "name": "Espressif Inc.",
+    "mac": "F4:CF:A2:31:10:DB",
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.19": {
+    "name": "Dispositivo en Red Wi-Fi",
+    "mac": "9C:9C:1F:89:4E:A7",
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.21": {
+    "name": "Dispositivo en Red Wi-Fi",
+    "mac": "B0:2A:43:0D:27:E0",
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.27": {
+    "name": "Android (adb-R52N40YGEFF-HViMpk)",
+    "mac": "5A:7A:BD:D5:EC:9C",
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.202": {
+    "name": "SM_T307U",
+    "mac": "80:20:FD:9A:41:08",
+    "network": "Casa (Familia Rosales Martinez)",
+    "last_port": "45304",
+    "is_static": true
+  },
+  "192.168.1.208": {
+    "name": "SM_A236M",
+    "mac": "0A:E7:47:70:D8:E2",
+    "is_static": true,
+    "network": "Casa (Familia Rosales Martinez)",
+    "last_port": "40003"
+  },
+  "192.168.1.209": {
+    "name": "2409BRN2CL",
+    "mac": "A8:2B:D5:ED:04:00",
+    "is_static": true,
+    "network": "Casa (Familia Rosales Martinez)",
+    "last_port": "39175"
+  },
+  "adb-25B6CCU00340-q0IVTD._adb-tls-connect._tcp": {
+    "name": "C20DS",
+    "mac": "",
+    "network": "Sitio de Trabajo"
+  },
+  "192.168.1.36": {
+    "name": "Dispositivo Móvil Wi-Fi (MAC Privada)",
+    "mac": "76:69:A2:DA:14:A9",
+    "network": "Sitio de Trabajo"
+  }
+}
