@@ -24,6 +24,10 @@ try:
     import windnd
 except ImportError:
     windnd = None
+try:
+    import winsound
+except ImportError:
+    winsound = None
 
 # ==============================================================================
 # CONSTANTES Y BASE DE DATOS LOCAL DE DISPOSITIVOS CONOCIDOS / ESTÁTICOS
@@ -36,6 +40,15 @@ if os.path.exists(_LOCAL_KNOWN_DEVICES):
 else:
     KNOWN_DEVICES_FILE = r"C:\Users\Administrador\AppData\Local\Programs\known_devices.json"
 SCRCPY_EXE = r"C:\scrcpy\scrcpy.exe"
+MIC_APK_PATH = os.path.join(_SCRIPT_DIR, "MicrofonoADB.apk")
+MIC_APK_PACKAGE = "com.humber.micaudio"
+MIC_APK_REMOTE_PORT = 17321
+KDS_SOUNDS_DIR = os.path.join(_SCRIPT_DIR, "kds_sounds")
+KDS_SOUND_FILES = {
+    "service_bell": os.path.join(KDS_SOUNDS_DIR, "kds_alert_service_bell.wav"),
+    "double_chime": os.path.join(KDS_SOUNDS_DIR, "kds_alert_double_chime.wav"),
+    "kitchen_timer": os.path.join(KDS_SOUNDS_DIR, "kds_alert_kitchen_timer.wav"),
+}
 
 # Prefijos OUI conocidos para resolución instantánea sin peticiones HTTP externas
 KNOWN_OUIS = {
@@ -258,31 +271,88 @@ def scan_subnet_slice(subnet, slice_idx):
 # ==============================================================================
 
 
+_ANDROID_LS_LINE_RE = re.compile(
+    r"^([drwxsStTlcbps\-]{10})[.+]?\s+"
+    r"(?:\d+\s+)??"
+    r"\S+\s+\S+\s+"
+    r"(?:(\d+)(?:,\s*\d+)?\s+)?"
+    r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s+"
+    r"(.+)$"
+)
+
+
+def parse_android_ls_line(line):
+    """Parsea una línea de `ls -la` compatible con Toolbox (Android 6.x como E800) y Toybox (Android 7+)."""
+    clean = str(line or "").strip()
+    m = _ANDROID_LS_LINE_RE.match(clean)
+    if not m:
+        return None
+    perms, size_str_raw, dt, raw_name = m.groups()
+    is_link = perms.startswith("l")
+    name = raw_name.split(" -> ", 1)[0] if (is_link and " -> " in raw_name) else raw_name
+    if name in (".", ".."):
+        return None
+    is_dir = perms.startswith("d")
+    size = int(size_str_raw) if (size_str_raw and size_str_raw.isdigit()) else 0
+    return {
+        "name": name,
+        "is_dir": is_dir,
+        "is_link": is_link,
+        "size": size,
+        "date": dt,
+    }
+
+
 def get_device_mounted_drive(device_name="", ip_or_serial=""):
     """Detecta la letra de unidad asignada por AndroidDrive (ej. 'E:', 'G:') para este dispositivo."""
+    if os.name != "nt":
+        return None
     try:
-        cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-        cmd = ["powershell", "-NoProfile", "-Command",
-               "Get-WmiObject Win32_LogicalDisk | Select DeviceID, VolumeName, FileSystem | ConvertTo-Json -Compress"]
-        p = subprocess.run(cmd, capture_output=True, text=True, creationflags=cflags, timeout=3)
-        out = p.stdout.strip()
-        if out:
-            data = json.loads(out)
-            if isinstance(data, dict):
-                data = [data]
-            name_words = [w for w in re.split(r"[\s\-_]+", str(device_name).lower()) if len(w) >= 3 and w not in ("dispositivo", "android", "samsung", "estatica", "estatico")]
-            for item in data:
-                vol = str(item.get("VolumeName", "")).lower()
-                fs = str(item.get("FileSystem", "")).lower()
-                dev_id = str(item.get("DeviceID", "")).rstrip("\\")
-                if fs == "fuse":
-                    if name_words and any(w in vol for w in name_words):
-                        return dev_id
-                    if ip_or_serial and str(ip_or_serial).lower() in vol:
-                        return dev_id
-            fuse_disks = [str(it.get("DeviceID", "")).rstrip("\\") for it in data if str(it.get("FileSystem", "")).lower() == "fuse"]
-            if fuse_disks:
-                return fuse_disks[0]
+        k32 = ctypes.windll.kernel32
+        buf = ctypes.create_unicode_buffer(1024)
+        n = k32.GetLogicalDriveStringsW(1024, buf)
+        drives = [d for d in buf[:n].split("\x00") if d and k32.GetDriveTypeW(d) == 3]
+        if not drives:
+            return None
+
+        def _probe_drive(root_path):
+            vol = ctypes.create_unicode_buffer(256)
+            fs = ctypes.create_unicode_buffer(256)
+            ok = k32.GetVolumeInformationW(root_path, vol, 256, None, None, None, fs, 256)
+            if ok:
+                return root_path.rstrip("\\"), vol.value.strip(), fs.value.strip().lower()
+            return None
+
+        # Consultar unidades en paralelo (evita bloqueos o timeouts de PowerShell/WMI con múltiples dispositivos)
+        win_fs = {"ntfs", "fat", "fat32", "exfat", "refs", "cdfs", "udf"}
+        android_disks = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(12, len(drives))) as ex:
+            for info in ex.map(_probe_drive, drives):
+                if not info:
+                    continue
+                dev_id, vol, fs = info
+                if dev_id and vol and fs not in win_fs:
+                    android_disks.append((dev_id, vol.lower(), re.sub(r"[\s_\-]+", "", vol.lower())))
+
+        dev_name_low = str(device_name or "").lower()
+        dev_compact = re.sub(r"[\s_\-\[\]]+", "", dev_name_low)
+        for prefix in ("pax", "sunmi", "landi", "samsung", "dispositivo", "estatica", "estática", "estatico", "estático"):
+            dev_compact = dev_compact.replace(prefix, "")
+
+        noise_words = {"dispositivo", "android", "samsung", "pax", "sunmi", "landi", "estatica", "estática", "estatico", "estático", "usb", "wifi"}
+        name_words = [w for w in re.split(r"[\s\-_\[\]]+", dev_name_low) if len(w) >= 2 and w not in noise_words]
+        ip_serial_low = str(ip_or_serial or "").strip().lower()
+
+        if dev_compact:
+            for dev_id, _vol_low, vol_compact in android_disks:
+                if dev_compact == vol_compact or (len(dev_compact) >= 3 and dev_compact in vol_compact):
+                    return dev_id
+
+        for dev_id, vol_low, vol_compact in android_disks:
+            if name_words and any(w in vol_low or w in vol_compact for w in name_words):
+                return dev_id
+            if ip_serial_low and ip_serial_low in vol_low:
+                return dev_id
     except Exception:
         pass
     return None
@@ -431,13 +501,633 @@ def ensure_device_internet_stability(target):
             pass
     threading.Thread(target=_bg, daemon=True).start()
 
-def launch_remote_control(serial_or_ip, display_id=0, device_name="", dev=None, turn_screen_off=False):
+# ==============================================================================
+# AUDIO POR MICRÓFONO (ANDROID 11+ NATIVO / ANDROID < 11 VÍA MicrofonoADB.apk)
+# ==============================================================================
+
+_DEV_SDK_CACHE = {}
+_DEV_MIC_PKG_CACHE = {}
+_DEV_PROBE_INFLIGHT = set()
+_DEV_MIC_CACHE_LOCK = threading.Lock()
+_ACTIVE_LEGACY_MIC_COUNTS = {}
+_ACTIVE_LEGACY_MIC_PLAYERS = set()
+_ACTIVE_LEGACY_MIC_LOCK = threading.Lock()
+
+
+def _mic_cache_keys(serial_or_ip, dev=None):
+    keys = []
+    if dev:
+        for k in (dev.get("key"), dev.get("ip"), dev.get("serial")):
+            if k and str(k) not in keys:
+                keys.append(str(k))
+    if serial_or_ip:
+        s = str(serial_or_ip).strip()
+        if s and s not in keys:
+            keys.append(s)
+        if ":" in s and not s.startswith("USB:"):
+            host = s.split(":", 1)[0]
+            if host and host not in keys:
+                keys.append(host)
+    return keys
+
+
+def sync_dev_mic_caches(dev):
+    """Copia en memoria los valores cacheados de Android SDK e instalación de MicrofonoADB."""
+    if not dev:
+        return
+    with _DEV_MIC_CACHE_LOCK:
+        for k in _mic_cache_keys(dev.get("serial"), dev=dev):
+            if k in _DEV_SDK_CACHE:
+                dev["android_sdk"] = _DEV_SDK_CACHE[k]
+                break
+        for k in _mic_cache_keys(dev.get("serial"), dev=dev):
+            if k in _DEV_MIC_PKG_CACHE:
+                dev["mic_apk_installed"] = _DEV_MIC_PKG_CACHE[k]
+                break
+
+
+def get_device_android_sdk(serial_or_ip, dev=None, force_refresh=False):
+    """Obtiene y cachea ro.build.version.sdk del dispositivo conectado por ADB."""
+    keys = _mic_cache_keys(serial_or_ip, dev=dev)
+    if not force_refresh:
+        with _DEV_MIC_CACHE_LOCK:
+            for k in keys:
+                if k in _DEV_SDK_CACHE:
+                    return _DEV_SDK_CACHE[k]
+
+    resolved_target = resolve_active_adb_target(serial_or_ip, dev=dev)
+    if not resolved_target:
+        return None
+    cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    try:
+        res = subprocess.run(
+            ["adb", "-s", str(resolved_target), "shell", "getprop", "ro.build.version.sdk"],
+            capture_output=True, text=True, errors="replace", creationflags=cflags, timeout=2.5
+        )
+        raw = (res.stdout or "").strip()
+        if raw.isdigit():
+            sdk = int(raw)
+            with _DEV_MIC_CACHE_LOCK:
+                for k in set(keys + _mic_cache_keys(resolved_target, dev=dev)):
+                    _DEV_SDK_CACHE[k] = sdk
+            if dev is not None:
+                dev["android_sdk"] = sdk
+            return sdk
+    except Exception:
+        pass
+    return None
+
+
+def is_mic_apk_installed(serial_or_ip, dev=None, force_refresh=False):
+    """Verifica si com.humber.micaudio (MicrofonoADB.apk) está instalado en el dispositivo."""
+    keys = _mic_cache_keys(serial_or_ip, dev=dev)
+    if not force_refresh:
+        with _DEV_MIC_CACHE_LOCK:
+            for k in keys:
+                if k in _DEV_MIC_PKG_CACHE:
+                    return _DEV_MIC_PKG_CACHE[k]
+
+    resolved_target = resolve_active_adb_target(serial_or_ip, dev=dev)
+    if not resolved_target:
+        return False
+    cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    try:
+        res = subprocess.run(
+            ["adb", "-s", str(resolved_target), "shell", "pm", "path", MIC_APK_PACKAGE],
+            capture_output=True, text=True, errors="replace", creationflags=cflags, timeout=2.5
+        )
+        # Solo interpretar respuesta válida del comando pm (evita falsos negativos si ADB falló)
+        out = (res.stdout or "").strip()
+        err = (res.stderr or "").strip().lower()
+        if "device offline" in err or "not found" in err:
+            return None
+        installed = ("package:" in out)
+        with _DEV_MIC_CACHE_LOCK:
+            for k in set(keys + _mic_cache_keys(resolved_target, dev=dev)):
+                _DEV_MIC_PKG_CACHE[k] = installed
+        if dev is not None:
+            dev["mic_apk_installed"] = installed
+        return installed
+    except Exception:
+        return None
+
+
+def install_mic_apk_on_device(serial_or_ip, dev=None):
+    """Instala MicrofonoADB.apk en un dispositivo Android < 11 y otorga el permiso RECORD_AUDIO."""
+    if not os.path.exists(MIC_APK_PATH):
+        return False, f"No se encontró el archivo APK en:\n{MIC_APK_PATH}"
+
+    resolved_target = resolve_active_adb_target(serial_or_ip, dev=dev)
+    if not resolved_target:
+        return False, "No se pudo resolver el objetivo ADB activo."
+
+    cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    try:
+        res = subprocess.run(
+            ["adb", "-s", str(resolved_target), "install", "-r", "-g", MIC_APK_PATH],
+            capture_output=True, text=True, errors="replace", creationflags=cflags, timeout=30
+        )
+        out_all = f"{res.stdout or ''}\n{res.stderr or ''}".strip()
+        if res.returncode != 0 and ("-g" in out_all or "unknown option" in out_all.lower()):
+            res = subprocess.run(
+                ["adb", "-s", str(resolved_target), "install", "-r", MIC_APK_PATH],
+                capture_output=True, text=True, errors="replace", creationflags=cflags, timeout=30
+            )
+            out_all = f"{res.stdout or ''}\n{res.stderr or ''}".strip()
+
+        if res.returncode != 0 or "Success" not in out_all:
+            return False, out_all or f"Código de salida ADB: {res.returncode}"
+
+        try:
+            subprocess.run(
+                ["adb", "-s", str(resolved_target), "shell", "pm", "grant", MIC_APK_PACKAGE, "android.permission.RECORD_AUDIO"],
+                capture_output=True, text=True, errors="replace", creationflags=cflags, timeout=5
+            )
+        except Exception:
+            pass
+
+        with _DEV_MIC_CACHE_LOCK:
+            for k in _mic_cache_keys(resolved_target, dev=dev):
+                _DEV_MIC_PKG_CACHE[k] = True
+        if dev is not None:
+            dev["mic_apk_installed"] = True
+        return True, "MicrofonoADB instalado correctamente."
+    except subprocess.TimeoutExpired:
+        return False, "Tiempo de espera agotado al instalar MicrofonoADB.apk."
+    except Exception as e:
+        return False, str(e)
+
+
+class _WAVEFORMATEX(ctypes.Structure):
+    _pack_ = 1
+    _fields_ = [
+        ("wFormatTag", ctypes.c_ushort),
+        ("nChannels", ctypes.c_ushort),
+        ("nSamplesPerSec", ctypes.c_uint32),
+        ("nAvgBytesPerSec", ctypes.c_uint32),
+        ("nBlockAlign", ctypes.c_ushort),
+        ("wBitsPerSample", ctypes.c_ushort),
+        ("cbSize", ctypes.c_ushort),
+    ]
+
+
+class _WAVEHDR(ctypes.Structure):
+    _fields_ = [
+        ("lpData", ctypes.c_char_p),
+        ("dwBufferLength", ctypes.c_uint32),
+        ("dwBytesRecorded", ctypes.c_uint32),
+        ("dwUser", ctypes.c_size_t),
+        ("dwFlags", ctypes.c_uint32),
+        ("dwLoops", ctypes.c_uint32),
+        ("lpNext", ctypes.c_void_p),
+        ("reserved", ctypes.c_size_t),
+    ]
+
+
+class WinmmPcmPlayer:
+    """Reproductor de audio PCM 16-bit de baja latencia usando winmm.dll nativo de Windows."""
+    WAVE_MAPPER = 0xFFFFFFFF
+    WAVE_FORMAT_PCM = 1
+    CALLBACK_EVENT = 0x00050000
+    WHDR_DONE = 0x00000001
+
+    def __init__(self, sample_rate=44100, channels=1, bits_per_sample=16, num_buffers=8):
+        self.winmm = ctypes.WinDLL("winmm", use_last_error=False)
+        self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=False)
+
+        self.winmm.waveOutOpen.argtypes = [
+            ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint, ctypes.POINTER(_WAVEFORMATEX),
+            ctypes.c_size_t, ctypes.c_size_t, ctypes.c_uint32
+        ]
+        self.winmm.waveOutOpen.restype = ctypes.c_uint
+        self.winmm.waveOutPrepareHeader.argtypes = [ctypes.c_void_p, ctypes.POINTER(_WAVEHDR), ctypes.c_uint]
+        self.winmm.waveOutPrepareHeader.restype = ctypes.c_uint
+        self.winmm.waveOutWrite.argtypes = [ctypes.c_void_p, ctypes.POINTER(_WAVEHDR), ctypes.c_uint]
+        self.winmm.waveOutWrite.restype = ctypes.c_uint
+        self.winmm.waveOutUnprepareHeader.argtypes = [ctypes.c_void_p, ctypes.POINTER(_WAVEHDR), ctypes.c_uint]
+        self.winmm.waveOutUnprepareHeader.restype = ctypes.c_uint
+        self.winmm.waveOutReset.argtypes = [ctypes.c_void_p]
+        self.winmm.waveOutReset.restype = ctypes.c_uint
+        self.winmm.waveOutClose.argtypes = [ctypes.c_void_p]
+        self.winmm.waveOutClose.restype = ctypes.c_uint
+
+        self.kernel32.CreateEventW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_wchar_p]
+        self.kernel32.CreateEventW.restype = ctypes.c_void_p
+        self.kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        self.kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+        self.kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        self.kernel32.CloseHandle.restype = ctypes.c_int
+
+        block_align = channels * (bits_per_sample // 8)
+        wfx = _WAVEFORMATEX()
+        wfx.wFormatTag = self.WAVE_FORMAT_PCM
+        wfx.nChannels = channels
+        wfx.nSamplesPerSec = sample_rate
+        wfx.nAvgBytesPerSec = sample_rate * block_align
+        wfx.nBlockAlign = block_align
+        wfx.wBitsPerSample = bits_per_sample
+        wfx.cbSize = 0
+
+        self.event = self.kernel32.CreateEventW(None, 0, 0, None)
+        self.hwo = ctypes.c_void_p()
+        res = self.winmm.waveOutOpen(
+            ctypes.byref(self.hwo),
+            self.WAVE_MAPPER,
+            ctypes.byref(wfx),
+            self.event or 0,
+            0,
+            self.CALLBACK_EVENT if self.event else 0,
+        )
+        if res != 0:
+            if self.event:
+                self.kernel32.CloseHandle(self.event)
+                self.event = None
+            raise OSError(f"waveOutOpen failed with code {res}")
+
+        self.slots = [{"buf": None, "hdr": _WAVEHDR(), "in_use": False} for _ in range(num_buffers)]
+        self._closed = False
+        self._lock = threading.Lock()
+        with _ACTIVE_LEGACY_MIC_LOCK:
+            _ACTIVE_LEGACY_MIC_PLAYERS.add(self)
+
+    def write(self, data):
+        if self._closed or not data:
+            return
+        while not self._closed:
+            with self._lock:
+                if self._closed or not self.hwo:
+                    return
+                slot = None
+                for s in self.slots:
+                    if not s["in_use"]:
+                        slot = s
+                        break
+                    if s["hdr"].dwFlags & self.WHDR_DONE:
+                        self.winmm.waveOutUnprepareHeader(self.hwo, ctypes.byref(s["hdr"]), ctypes.sizeof(_WAVEHDR))
+                        s["in_use"] = False
+                        s["buf"] = None
+                        slot = s
+                        break
+                if slot is not None:
+                    c_buf = ctypes.create_string_buffer(data, len(data))
+                    hdr = slot["hdr"]
+                    ctypes.memset(ctypes.byref(hdr), 0, ctypes.sizeof(_WAVEHDR))
+                    hdr.lpData = ctypes.cast(c_buf, ctypes.c_char_p)
+                    hdr.dwBufferLength = len(data)
+                    res_p = self.winmm.waveOutPrepareHeader(self.hwo, ctypes.byref(hdr), ctypes.sizeof(_WAVEHDR))
+                    if res_p != 0:
+                        raise OSError(f"waveOutPrepareHeader failed: {res_p}")
+                    slot["buf"] = c_buf
+                    slot["in_use"] = True
+                    res_w = self.winmm.waveOutWrite(self.hwo, ctypes.byref(hdr), ctypes.sizeof(_WAVEHDR))
+                    if res_w != 0:
+                        self.winmm.waveOutUnprepareHeader(self.hwo, ctypes.byref(hdr), ctypes.sizeof(_WAVEHDR))
+                        slot["in_use"] = False
+                        slot["buf"] = None
+                        raise OSError(f"waveOutWrite failed: {res_w}")
+                    return
+            if self.event:
+                self.kernel32.WaitForSingleObject(self.event, 50)
+            else:
+                time.sleep(0.01)
+
+    def close(self):
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            if self.hwo:
+                try:
+                    self.winmm.waveOutReset(self.hwo)
+                except Exception:
+                    pass
+                for s in self.slots:
+                    if s["in_use"]:
+                        try:
+                            self.winmm.waveOutUnprepareHeader(self.hwo, ctypes.byref(s["hdr"]), ctypes.sizeof(_WAVEHDR))
+                        except Exception:
+                            pass
+                        s["in_use"] = False
+                        s["buf"] = None
+                try:
+                    self.winmm.waveOutClose(self.hwo)
+                except Exception:
+                    pass
+                self.hwo = None
+            if self.event:
+                try:
+                    self.kernel32.CloseHandle(self.event)
+                except Exception:
+                    pass
+                self.event = None
+        with _ACTIVE_LEGACY_MIC_LOCK:
+            _ACTIVE_LEGACY_MIC_PLAYERS.discard(self)
+
+
+def close_all_legacy_mic_players():
+    with _ACTIVE_LEGACY_MIC_LOCK:
+        players = list(_ACTIVE_LEGACY_MIC_PLAYERS)
+    for p in players:
+        try:
+            p.close()
+        except Exception:
+            pass
+    stop_all_kds_alarm_sound_bridges()
+
+
+_ACTIVE_KDS_BRIDGES = {}
+_ACTIVE_KDS_SCRCPY_PROCS = {}
+_ACTIVE_KDS_LOCK = threading.Lock()
+
+
+def play_kds_alert_sound(sound_key="service_bell"):
+    """Reproduce de forma asíncrona en el PC el archivo WAV original del timbre KDS."""
+    if winsound is None or os.name != "nt":
+        return False
+    wav_path = KDS_SOUND_FILES.get(sound_key) or KDS_SOUND_FILES.get("service_bell")
+    if not wav_path or not os.path.exists(wav_path):
+        return False
+    try:
+        winsound.PlaySound(wav_path, winsound.SND_FILENAME | winsound.SND_ASYNC | winsound.SND_NODEFAULT)
+        return True
+    except Exception:
+        return False
+
+
+def has_open_scrcpy_window_for(device_name=""):
+    """Verifica en <0.2ms mediante Win32 EnumWindows si hay una ventana de scrcpy abierta para el dispositivo."""
+    if os.name != "nt":
+        return False
+    needle = (device_name or "").strip().lower()
+    if not needle:
+        return False
+    found = [False]
+    try:
+        u32 = ctypes.windll.user32
+        WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p)
+
+        def _cb(hwnd, _lparam):
+            if u32.IsWindowVisible(hwnd):
+                length = u32.GetWindowTextLengthW(hwnd)
+                if length > 0:
+                    buf = ctypes.create_unicode_buffer(length + 1)
+                    u32.GetWindowTextW(hwnd, buf, length + 1)
+                    title = buf.value.lower()
+                    if needle in title and ("control remoto" in title or "pantalla cliente" in title or "scrcpy" in title):
+                        found[0] = True
+                        return 0
+            return 1
+
+        u32.EnumWindows(WNDENUMPROC(_cb), 0)
+    except Exception:
+        pass
+    return found[0]
+
+
+def stop_all_kds_alarm_sound_bridges():
+    with _ACTIVE_KDS_LOCK:
+        procs = list(_ACTIVE_KDS_BRIDGES.values())
+        _ACTIVE_KDS_BRIDGES.clear()
+        _ACTIVE_KDS_SCRCPY_PROCS.clear()
+    for p in procs:
+        try:
+            p.terminate()
+        except Exception:
+            pass
+
+
+def start_kds_alarm_sound_bridge(resolved_target, scrcpy_proc=None, device_name="", dev=None):
+    """
+    Escucha en tiempo real por ADB los eventos de alarma KDS (KdsAlertPlayer / USAGE_ALARM)
+    en dispositivos sin micrófono físico (como SUNMI D2s_KDS_STGL) y reproduce el mismo WAV en el PC.
+    """
+    target_str = str(resolved_target or "").strip()
+    if not target_str:
+        return
+
+    with _ACTIVE_KDS_LOCK:
+        if scrcpy_proc is not None:
+            _ACTIVE_KDS_SCRCPY_PROCS.setdefault(target_str, set()).add(scrcpy_proc)
+        existing = _ACTIVE_KDS_BRIDGES.get(target_str)
+        if existing is not None and existing.poll() is None:
+            return
+
+    cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+    def _worker():
+        log_proc = None
+        try:
+            actual_target = str(resolve_active_adb_target(target_str, dev=dev) or target_str)
+            log_proc = subprocess.Popen(
+                ["adb", "-s", actual_target, "logcat", "-T", "1", "-s", "KdsAlertPlayer:D"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=cflags,
+            )
+            with _ACTIVE_KDS_LOCK:
+                prev = _ACTIVE_KDS_BRIDGES.get(target_str)
+                if prev is not None and prev.poll() is None and prev is not log_proc:
+                    try:
+                        log_proc.terminate()
+                    except Exception:
+                        pass
+                    return
+                _ACTIVE_KDS_BRIDGES[target_str] = log_proc
+
+            t_start = time.monotonic()
+            state = {"last_kds_ts": 0.0, "last_sound": "service_bell"}
+
+            def _watchdog():
+                while log_proc.poll() is None:
+                    time.sleep(1.5)
+                    with _ACTIVE_KDS_LOCK:
+                        if target_str not in _ACTIVE_KDS_SCRCPY_PROCS:
+                            continue
+                        pset = _ACTIVE_KDS_SCRCPY_PROCS.get(target_str, set())
+                        alive = {p for p in pset if p.poll() is None}
+                        _ACTIVE_KDS_SCRCPY_PROCS[target_str] = alive
+                        has_proc = bool(alive)
+                    if not has_proc:
+                        try:
+                            log_proc.terminate()
+                        except Exception:
+                            pass
+                        break
+
+            threading.Thread(target=_watchdog, daemon=True).start()
+
+            for raw_line in log_proc.stdout:
+                if time.monotonic() - t_start < 0.40:
+                    continue
+                line = raw_line.strip()
+                if not line:
+                    continue
+                low = line.lower()
+                if "kdsalertplayer" in low and any(k in low for k in ("sonó", "sono", "service_bell", "double_chime", "kitchen_timer")):
+                    if "double_chime" in low or "doble" in low:
+                        s_key = "double_chime"
+                    elif "kitchen_timer" in low or "timer" in low or "alarma" in low:
+                        s_key = "kitchen_timer"
+                    else:
+                        s_key = "service_bell"
+                    state["last_sound"] = s_key
+                    state["last_kds_ts"] = time.monotonic()
+                    play_kds_alert_sound(s_key)
+                elif "af::trackhandle" in low and "opplayaudio:" in low and "usage:4" in low and "not muted" in low:
+                    def _delayed_fallback():
+                        time.sleep(0.16)
+                        if time.monotonic() - state["last_kds_ts"] > 0.35:
+                            state["last_kds_ts"] = time.monotonic()
+                            play_kds_alert_sound(state["last_sound"])
+                    threading.Thread(target=_delayed_fallback, daemon=True).start()
+        except Exception:
+            pass
+        finally:
+            with _ACTIVE_KDS_LOCK:
+                if _ACTIVE_KDS_BRIDGES.get(target_str) is log_proc:
+                    _ACTIVE_KDS_BRIDGES.pop(target_str, None)
+            if log_proc is not None and log_proc.poll() is None:
+                try:
+                    log_proc.terminate()
+                except Exception:
+                    pass
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def start_android_legacy_mic_stream(resolved_target, scrcpy_proc, device_name=""):
+    """Conecta por adb forward con MicrofonoADB en Android < 11 y reproduce su micrófono mientras scrcpy esté abierto."""
+    cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+    def _worker():
+        target_str = str(resolved_target)
+        local_port = None
+        sock = None
+        player = None
+        counted = False
+
+        try:
+            time.sleep(0.25)
+            if scrcpy_proc is not None and scrcpy_proc.poll() is not None:
+                return
+
+            with _ACTIVE_LEGACY_MIC_LOCK:
+                _ACTIVE_LEGACY_MIC_COUNTS[target_str] = _ACTIVE_LEGACY_MIC_COUNTS.get(target_str, 0) + 1
+                counted = True
+
+            # Asignar un puerto local TCP libre para túnel ADB
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tmp_s:
+                tmp_s.bind(("127.0.0.1", 0))
+                local_port = tmp_s.getsockname()[1]
+
+            subprocess.run(
+                ["adb", "-s", target_str, "forward", f"tcp:{local_port}", f"tcp:{MIC_APK_REMOTE_PORT}"],
+                capture_output=True, text=True, creationflags=cflags, timeout=5
+            )
+
+            # Garantizar permiso e iniciar el servicio en primer plano mediante MainActivity transparente
+            try:
+                subprocess.run(
+                    ["adb", "-s", target_str, "shell", "pm", "grant", MIC_APK_PACKAGE, "android.permission.RECORD_AUDIO"],
+                    capture_output=True, creationflags=cflags, timeout=4
+                )
+            except Exception:
+                pass
+
+            subprocess.run(
+                ["adb", "-s", target_str, "shell", "am", "start", "-n", f"{MIC_APK_PACKAGE}/.MainActivity"],
+                capture_output=True, text=True, creationflags=cflags, timeout=6
+            )
+
+            # Reintentar conexión hasta que el servicio esté escuchando en loopback
+            for _ in range(20):
+                if scrcpy_proc is not None and scrcpy_proc.poll() is not None:
+                    return
+                try:
+                    sock = socket.create_connection(("127.0.0.1", local_port), timeout=1.5)
+                    break
+                except Exception:
+                    time.sleep(0.15)
+
+            if sock is None:
+                return
+
+            sock.settimeout(3.0)
+            hdr = b""
+            while len(hdr) < 12:
+                chunk = sock.recv(12 - len(hdr))
+                if not chunk:
+                    return
+                hdr += chunk
+
+            if hdr[:4] != b"MIC1":
+                return
+            sample_rate, channels, bits = struct.unpack("<IHH", hdr[4:12])
+            if sample_rate <= 0 or channels not in (1, 2) or bits not in (8, 16):
+                return
+
+            player = WinmmPcmPlayer(sample_rate=sample_rate, channels=channels, bits_per_sample=bits)
+            sock.settimeout(1.0)
+            while scrcpy_proc is None or scrcpy_proc.poll() is None:
+                try:
+                    pcm = sock.recv(4096)
+                    if not pcm:
+                        break
+                    player.write(pcm)
+                except socket.timeout:
+                    continue
+                except Exception:
+                    break
+        except Exception:
+            pass
+        finally:
+            if player is not None:
+                player.close()
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            if local_port is not None:
+                try:
+                    subprocess.run(
+                        ["adb", "-s", target_str, "forward", "--remove", f"tcp:{local_port}"],
+                        capture_output=True, creationflags=cflags, timeout=3
+                    )
+                except Exception:
+                    pass
+            if counted:
+                should_stop_service = False
+                with _ACTIVE_LEGACY_MIC_LOCK:
+                    rem = max(0, _ACTIVE_LEGACY_MIC_COUNTS.get(target_str, 1) - 1)
+                    if rem == 0:
+                        _ACTIVE_LEGACY_MIC_COUNTS.pop(target_str, None)
+                        should_stop_service = True
+                    else:
+                        _ACTIVE_LEGACY_MIC_COUNTS[target_str] = rem
+                if should_stop_service:
+                    try:
+                        subprocess.run(
+                            ["adb", "-s", target_str, "shell", "am", "force-stop", MIC_APK_PACKAGE],
+                            capture_output=True, creationflags=cflags, timeout=4
+                        )
+                    except Exception:
+                        pass
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def launch_remote_control(serial_or_ip, display_id=0, device_name="", dev=None, turn_screen_off=False, audio_source=None):
     """
     Lanza una ventana NORMAL de scrcpy (minimizables y maximizables, NO en pantalla completa)
     con optimizaciones de hardware para Allwinner/Rockchip, preservación de ancho de banda Wi-Fi
     y sin consolas negras.
     Compatible con CUALQUIER puerto (5555, dinámico Wi-Fi o TLS mDNS).
     turn_screen_off: Si es True, apaga la pantalla física del dispositivo manteniendo el control remoto total.
+    audio_source: None (por defecto sin cambios), o 'mic' para escuchar por micrófono (Android 11+ nativo, < 11 vía MicrofonoADB.apk).
     """
     if not os.path.exists(SCRCPY_EXE):
         messagebox.showerror("Error", f"No se encontró el archivo scrcpy en: {SCRCPY_EXE}")
@@ -450,13 +1140,57 @@ def launch_remote_control(serial_or_ip, display_id=0, device_name="", dev=None, 
     ensure_device_internet_stability(resolved_target)
 
     name_clean = device_name or (dev.get("name") if dev else "") or str(resolved_target)
-    suffix = " [🕶 Pantalla Física Apagada]" if turn_screen_off else ""
+
+    legacy_mic_target = None
+    use_scrcpy_mic = False
+    if audio_source == "mic":
+        sdk = get_device_android_sdk(resolved_target, dev=dev)
+        if sdk is not None and sdk < 30:
+            installed = is_mic_apk_installed(resolved_target, dev=dev)
+            if not installed:
+                if not os.path.exists(MIC_APK_PATH):
+                    messagebox.showwarning(
+                        "APK no encontrado",
+                        f"{name_clean} tiene Android < 11 (SDK {sdk}), pero no se encontró:\n{MIC_APK_PATH}"
+                    )
+                    return
+                resp = messagebox.askyesno(
+                    "Instalar MicrofonoADB",
+                    f"{name_clean} usa Android < 11 (SDK {sdk}).\n\n"
+                    "Para escuchar los sonidos físicos por el micrófono se requiere la mini app 'MicrofonoADB'.\n\n"
+                    "¿Deseas instalarla automáticamente ahora y abrir la pantalla con micrófono?"
+                )
+                if not resp:
+                    return
+                ok_inst, err_inst = install_mic_apk_on_device(resolved_target, dev=dev)
+                if not ok_inst:
+                    messagebox.showerror("Error al instalar MicrofonoADB", f"No se pudo instalar en {name_clean}:\n{err_inst}")
+                    return
+            legacy_mic_target = resolved_target
+        else:
+            use_scrcpy_mic = True
+
+    suffix_parts = []
+    if turn_screen_off:
+        suffix_parts.append("🕶 Pantalla Física Apagada")
+    if audio_source == "mic":
+        suffix_parts.append("🎙 Micrófono")
+    suffix = f" [{' | '.join(suffix_parts)}]" if suffix_parts else ""
+
     if display_id == 0:
         win_title = f"{name_clean} (Control Remoto){suffix}"
     else:
         win_title = f"{name_clean} (Pantalla Cliente {display_id}){suffix}"
 
-    cmd = [SCRCPY_EXE, "-s", str(resolved_target), "--no-audio"]
+    is_kds_no_hw_mic = ("d2s" in name_clean.lower() or "kds" in name_clean.lower())
+
+    cmd = [SCRCPY_EXE, "-s", str(resolved_target)]
+    if legacy_mic_target:
+        cmd.append("--no-audio")
+    elif use_scrcpy_mic and not is_kds_no_hw_mic:
+        cmd.append("--audio-source=mic")
+    elif display_id > 0:
+        cmd.append("--no-audio")
     if turn_screen_off:
         cmd.extend(["--turn-screen-off", "--stay-awake"])
 
@@ -503,6 +1237,10 @@ def launch_remote_control(serial_or_ip, display_id=0, device_name="", dev=None, 
     def _launch_and_check():
         try:
             proc = subprocess.Popen(cmd, creationflags=cflags, stderr=subprocess.PIPE, text=True, errors="replace")
+            if legacy_mic_target:
+                start_android_legacy_mic_stream(legacy_mic_target, proc, device_name=name_clean)
+            if display_id == 0 and (audio_source == "mic" or is_kds_no_hw_mic):
+                start_kds_alarm_sound_bridge(resolved_target, scrcpy_proc=proc, device_name=name_clean)
             try:
                 ret = proc.wait(timeout=2.0)
                 if ret != 0:
@@ -1364,8 +2102,8 @@ class RealTimeMultiADBApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Administrador de Dispositivos Wi-Fi y USB (Organizado por Red)")
-        self.root.geometry("1260x660")
-        self.root.minsize(1040, 500)
+        self.root.geometry("1350x680")
+        self.root.minsize(1140, 520)
 
         self.scanning = False
         self.connecting = False
@@ -1374,6 +2112,7 @@ class RealTimeMultiADBApp:
         self.missing_counters = {}
         self.port_fail_count = {}
         self.connecting_ips = set()
+        self._installing_mic_keys = set()
         self.watcher_slice_idx = 0
         self._auto_opened_usb_serials = set()
 
@@ -1479,7 +2218,7 @@ class RealTimeMultiADBApp:
         ttk.Label(col_header, text="Dirección IP", width=20, font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=3)
         ttk.Label(col_header, text="Dirección MAC", width=17, font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=3)
         ttk.Label(col_header, text="Estado / Conexión", width=24, font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=3)
-        ttk.Label(col_header, text="Control Remoto / ADB", width=58, font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=3)
+        ttk.Label(col_header, text="Control Remoto / ADB", width=66, font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=3)
 
         ttk.Separator(root, orient=tk.HORIZONTAL).pack(fill=tk.X, padx=12)
 
@@ -1532,6 +2271,10 @@ class RealTimeMultiADBApp:
 
         self._hotkey_thread = threading.Thread(target=self._global_hotkey_loop, daemon=True)
         self._hotkey_thread.start()
+
+        if _SHOW_WINDOW_EVENT_HANDLE:
+            self._wake_thread = threading.Thread(target=self._single_instance_wake_loop, daemon=True)
+            self._wake_thread.start()
 
         # Iniciar escaneo inicial
         self.root.after(100, self.trigger_scan)
@@ -1593,8 +2336,22 @@ class RealTimeMultiADBApp:
             except Exception:
                 pass
 
+    def _single_instance_wake_loop(self):
+        k32 = _SINGLE_INSTANCE_K32
+        evt = _SHOW_WINDOW_EVENT_HANDLE
+        if not k32 or not evt:
+            return
+        while not self._stop_watcher.is_set():
+            try:
+                res = k32.WaitForSingleObject(evt, 250)
+                if res == 0 and not self._stop_watcher.is_set():
+                    self.post_gui(self.show_from_background)
+            except Exception:
+                time.sleep(0.25)
+
     def _on_closing(self):
         self._stop_watcher.set()
+        close_all_legacy_mic_players()
         self.root.destroy()
 
     def post_gui(self, fn, *args, **kwargs):
@@ -1746,6 +2503,7 @@ class RealTimeMultiADBApp:
                 for u in usb_results:
                     u["network"] = "USB Directo"
                     u["is_on_current_net"] = True
+                    sync_dev_mic_caches(u)
                     k = u["key"]
                     live_map[k] = u
                     if u.get("wlan_ip"):
@@ -1920,6 +2678,7 @@ class RealTimeMultiADBApp:
                         "network": dev_network,
                         "is_on_current_net": is_on_current_net
                     }
+                    sync_dev_mic_caches(dev_item)
                     live_map[ip] = dev_item
 
                 # 5. Aplicación diferencial
@@ -1954,8 +2713,13 @@ class RealTimeMultiADBApp:
                             old_dev.get("name") != dev.get("name") or
                             old_dev.get("port") != dev.get("port") or
                             old_dev.get("serial") != dev.get("serial") or
-                            old_dev.get("is_on_current_net") != dev.get("is_on_current_net")):
+                            old_dev.get("is_on_current_net") != dev.get("is_on_current_net") or
+                            old_dev.get("android_sdk") != dev.get("android_sdk") or
+                            old_dev.get("mic_apk_installed") != dev.get("mic_apk_installed")):
                             self.post_gui(self._update_row_state_by_key, k, dev)
+                        if (dev.get("is_adb_connected") or (dev.get("is_usb") and not dev.get("is_offline") and not dev.get("is_unauthorized"))) and not dev.get("is_local_or_router"):
+                            if dev.get("android_sdk") is None:
+                                self._schedule_mic_probe(dev)
 
             except Exception:
                 pass
@@ -1967,6 +2731,7 @@ class RealTimeMultiADBApp:
     def _create_row(self, dev):
         dev_key = dev.get("key") or (f"USB:{dev['serial']}" if dev.get("is_usb") else dev["ip"])
         dev["key"] = dev_key
+        sync_dev_mic_caches(dev)
 
         if dev_key in self.device_rows:
             return
@@ -2088,6 +2853,14 @@ class RealTimeMultiADBApp:
                 label="🕶 Pantalla 1 (Física Apagada)",
                 command=lambda d=dev: self.start_control_session(d, display_id=0, turn_screen_off=True)
             )
+            menu_pantalla.add_command(
+                label="🎙 Pantalla 1 (Audio por Micrófono)",
+                command=lambda k=dev_key, d=dev: self.start_control_session(self._get_row_dev(k, d), display_id=0, turn_screen_off=None, audio_source="mic")
+            )
+            menu_pantalla.add_command(
+                label="🕶🎙 Pantalla 1 (Apagada + Micrófono)",
+                command=lambda k=dev_key, d=dev: self.start_control_session(self._get_row_dev(k, d), display_id=0, turn_screen_off=True, audio_source="mic")
+            )
             menu_pantalla.add_separator()
             menu_pantalla.add_command(
                 label="🖥 Pantalla 2 (Cliente)",
@@ -2107,6 +2880,14 @@ class RealTimeMultiADBApp:
             menu_pantalla.add_command(
                 label="🕶 Pantalla (Física Apagada)",
                 command=lambda d=dev: self.start_control_session(d, display_id=0, turn_screen_off=True)
+            )
+            menu_pantalla.add_command(
+                label="🎙 Pantalla (Audio por Micrófono)",
+                command=lambda k=dev_key, d=dev: self.start_control_session(self._get_row_dev(k, d), display_id=0, turn_screen_off=None, audio_source="mic")
+            )
+            menu_pantalla.add_command(
+                label="🕶🎙 Pantalla (Física Apagada + Micrófono)",
+                command=lambda k=dev_key, d=dev: self.start_control_session(self._get_row_dev(k, d), display_id=0, turn_screen_off=True, audio_source="mic")
             )
             mb_pantalla["menu"] = menu_pantalla
             mb_pantalla.pack(side=tk.LEFT, padx=2)
@@ -2161,6 +2942,18 @@ class RealTimeMultiADBApp:
 
         btn_port_toggle.pack(side=tk.LEFT, padx=2)
 
+        # 4. Botón condicional para Android < 11: instala MicrofonoADB.apk y permite escuchar su micrófono
+        btn_mic_apk = ttk.Button(ctrl_frame, text="🎙 Instalar Mic", width=15)
+        def _mic_popup(event, k=dev_key, d=dev):
+            latest = self._get_row_dev(k, d)
+            m = tk.Menu(self.root, tearoff=0)
+            m.add_command(label="🔄 Reinstalar app MicrofonoADB", command=lambda: self.install_mic_apk_for_device(latest))
+            m.add_command(label="🎙 Abrir Pantalla con Micrófono", command=lambda: self.start_control_session(latest, display_id=0, turn_screen_off=None, audio_source="mic"))
+            m.add_command(label="🕶🎙 Abrir Apagada + Micrófono", command=lambda: self.start_control_session(latest, display_id=0, turn_screen_off=True, audio_source="mic"))
+            m.tk_popup(event.x_root, event.y_root)
+        btn_mic_apk.bind("<Button-3>", _mic_popup)
+        self._refresh_mic_apk_button(btn_mic_apk, dev, dev_key)
+
         # Menú contextual para cambiar de red
         def _popup_menu(event, d=dev):
             m = tk.Menu(self.root, tearoff=0)
@@ -2185,9 +2978,11 @@ class RealTimeMultiADBApp:
             "pantalla_widget": pantalla_widget,
             "btn_files": btn_files,
             "btn_port_toggle": btn_port_toggle,
+            "btn_mic_apk": btn_mic_apk,
             "dev": dev,
             "group_name": group_name
         }
+        self._schedule_mic_probe(dev)
 
     def change_device_network(self, dev, new_network):
         ip = dev.get("ip")
@@ -2215,6 +3010,7 @@ class RealTimeMultiADBApp:
             return
 
         row_info["dev"] = dev
+        sync_dev_mic_caches(dev)
         is_usb = dev.get("is_usb", False)
         is_adb = dev.get("is_adb_connected", False)
         is_sys = dev.get("is_local_or_router", False)
@@ -2312,6 +3108,9 @@ class RealTimeMultiADBApp:
             if not can_connect:
                 row_info["chk_var"].set(False)
 
+        self._refresh_mic_apk_button(row_info.get("btn_mic_apk"), dev, dev_key)
+        self._schedule_mic_probe(dev)
+
         # Reordenar dinámicamente según el estado de conexión y la IP
         self.apply_filter()
 
@@ -2345,6 +3144,7 @@ class RealTimeMultiADBApp:
                 dev["name"] = model
             self.set_status(f"¡Conectado exitosamente a {dev['name']} ({detail})!")
             self.post_gui(self._update_row_state_by_key, dev_key, dev)
+            self._schedule_mic_probe(dev)
         else:
             open_now = check_tcp_ports_fast(ip, [5555, 7888])
             dev["is_port_open"] = bool(open_now)
@@ -2831,29 +3631,52 @@ class RealTimeMultiADBApp:
 
             def _fetch():
                 items = []
+                err_msg = ""
                 try:
                     res = subprocess.run(["adb", "-s", str(target), "shell", f'ls -la "{norm_path}"'],
                                          capture_output=True, text=True, errors="replace", creationflags=cflags, timeout=8)
                     for line in res.stdout.splitlines():
-                        line = line.strip()
-                        m = re.match(r"^([drwxsStT\-]{10})\s+\d+\s+\S+\s+\S+\s+(\d+)\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\s+(.+)$", line)
-                        if m:
-                            perms, size, dt, name = m.groups()
-                            if name in (".", ".."):
-                                continue
-                            is_dir = perms.startswith("d")
-                            items.append({
-                                "name": name,
-                                "is_dir": is_dir,
-                                "size": int(size),
-                                "size_str": "-" if is_dir else _format_size(int(size)),
-                                "date": dt
-                            })
+                        parsed = parse_android_ls_line(line)
+                        if not parsed:
+                            continue
+                        is_dir = parsed["is_dir"]
+                        sz = parsed["size"]
+                        items.append({
+                            "name": parsed["name"],
+                            "is_dir": is_dir,
+                            "is_link": parsed["is_link"],
+                            "size": sz,
+                            "size_str": "-" if is_dir else _format_size(sz),
+                            "date": parsed["date"]
+                        })
+                    # Resolver symlinks (ej. /sdcard -> /storage/self/primary) para permitir navegarlos como carpetas
+                    link_items = [it for it in items if it.get("is_link")]
+                    if link_items:
+                        checks = " ; ".join(
+                            f'[ -d "{norm_path}{it["name"].replace(chr(34), "")}" ] && echo "{it["name"].replace(chr(34), "")}"'
+                            for it in link_items
+                        )
+                        try:
+                            chk_res = subprocess.run(["adb", "-s", str(target), "shell", checks],
+                                                     capture_output=True, text=True, errors="replace", creationflags=cflags, timeout=4)
+                            dir_links = {ln.strip() for ln in chk_res.stdout.splitlines() if ln.strip()}
+                            for it in link_items:
+                                if it["name"] in dir_links:
+                                    it["is_dir"] = True
+                                    it["size_str"] = "-"
+                        except Exception:
+                            pass
+                    if not items and res.returncode != 0:
+                        raw_err = (res.stderr or res.stdout or "").strip()
+                        if raw_err:
+                            err_msg = raw_err.splitlines()[-1]
                     items.sort(key=lambda x: (0 if x["is_dir"] else 1, x["name"].lower()))
-                except Exception:
-                    pass
+                except Exception as ex:
+                    err_msg = str(ex)
 
                 def _populate():
+                    if not dialog.winfo_exists():
+                        return
                     for row_id in tree.get_children():
                         tree.delete(row_id)
                     current_items.clear()
@@ -2863,7 +3686,10 @@ class RealTimeMultiADBApp:
                         tree.insert("", tk.END, values=(icon_type, it["name"], it["size_str"], it["date"]))
                     dirs_cnt = sum(1 for it in items if it["is_dir"])
                     files_cnt = len(items) - dirs_cnt
-                    status_lbl.config(text=f"{dirs_cnt} carpetas, {files_cnt} archivos en {norm_path} | Listo.")
+                    if err_msg and not items:
+                        status_lbl.config(text=f"Error al acceder a {norm_path}: {err_msg}")
+                    else:
+                        status_lbl.config(text=f"{dirs_cnt} carpetas, {files_cnt} archivos en {norm_path} | Listo.")
                     dialog.config(cursor="")
 
                 dialog.after(0, _populate)
@@ -4039,8 +4865,177 @@ class RealTimeMultiADBApp:
         except Exception:
             pass
 
-    def start_control_session(self, dev, display_id=0, turn_screen_off=None):
+    def _get_row_dev(self, dev_key, fallback_dev=None):
+        row_info = self.device_rows.get(dev_key)
+        if row_info and row_info.get("dev"):
+            return row_info["dev"]
+        return fallback_dev
+
+    def _refresh_mic_apk_button(self, btn_mic, dev, dev_key):
+        if not btn_mic:
+            return
+        is_usb = dev.get("is_usb", False)
+        is_adb = dev.get("is_adb_connected", False)
+        is_sys = dev.get("is_local_or_router", False)
+        is_ready = (is_adb or (is_usb and not dev.get("is_offline") and not dev.get("is_unauthorized"))) and not is_sys
+        sdk = dev.get("android_sdk")
+
+        if is_ready and sdk is not None and sdk < 30:
+            if dev_key in self._installing_mic_keys:
+                btn_mic.config(text="⏳ Instalando...", state=tk.DISABLED)
+            elif dev.get("mic_apk_installed"):
+                btn_mic.config(
+                    text="🎙 Escuchar Mic",
+                    state=tk.NORMAL,
+                    command=lambda k=dev_key, d=dev: self._on_mic_apk_button(self._get_row_dev(k, d))
+                )
+            else:
+                btn_mic.config(
+                    text="🎙 Instalar Mic",
+                    state=tk.NORMAL,
+                    command=lambda k=dev_key, d=dev: self._on_mic_apk_button(self._get_row_dev(k, d))
+                )
+            if not btn_mic.winfo_ismapped():
+                btn_mic.pack(side=tk.LEFT, padx=2)
+        else:
+            if not is_ready and dev_key:
+                with _DEV_MIC_CACHE_LOCK:
+                    for ck in _mic_cache_keys(dev.get("serial"), dev=dev):
+                        _DEV_MIC_PKG_CACHE.pop(ck, None)
+                dev.pop("mic_apk_installed", None)
+            if btn_mic.winfo_ismapped():
+                btn_mic.pack_forget()
+
+    def _apply_probed_mic_info(self, dev_key, sdk, installed):
+        row_info = self.device_rows.get(dev_key)
+        if not row_info:
+            return
+        d = row_info["dev"]
+        changed = False
+        if sdk is not None and d.get("android_sdk") != sdk:
+            d["android_sdk"] = sdk
+            changed = True
+        if installed is not None and d.get("mic_apk_installed") != installed:
+            d["mic_apk_installed"] = installed
+            changed = True
+        if changed:
+            self._refresh_mic_apk_button(row_info.get("btn_mic_apk"), d, dev_key)
+
+    def _schedule_mic_probe(self, dev):
+        if not dev:
+            return
+        is_usb = dev.get("is_usb", False)
+        is_adb = dev.get("is_adb_connected", False)
+        is_sys = dev.get("is_local_or_router", False)
+        if not ((is_adb or (is_usb and not dev.get("is_offline") and not dev.get("is_unauthorized"))) and not is_sys):
+            return
+
+        dev_name_str = str(dev.get("name") or "")
+        target_hint = dev.get("serial") or (f"{dev.get('ip')}:{dev.get('port')}" if dev.get("port") else dev.get("ip"))
+        if target_hint and ("d2s" in dev_name_str.lower() or "kds" in dev_name_str.lower()):
+            start_kds_alarm_sound_bridge(target_hint, scrcpy_proc=None, device_name=dev_name_str, dev=dev)
+
+        sync_dev_mic_caches(dev)
+        sdk_now = dev.get("android_sdk")
+        pkg_now = dev.get("mic_apk_installed")
+        if sdk_now is not None and (sdk_now >= 30 or pkg_now is not None):
+            return
+
+        dev_key = dev.get("key") or dev.get("ip") or dev.get("serial")
+        if not dev_key:
+            return
+
+        with _DEV_MIC_CACHE_LOCK:
+            if dev_key in _DEV_PROBE_INFLIGHT:
+                return
+            _DEV_PROBE_INFLIGHT.add(dev_key)
+
+        target_hint = dev.get("serial") or (f"{dev.get('ip')}:{dev.get('port')}" if dev.get("port") else dev.get("ip"))
+        dev_snapshot = dict(dev)
+
+        def _probe():
+            try:
+                sdk = get_device_android_sdk(target_hint, dev=dev_snapshot)
+                installed = None
+                if sdk is not None and sdk < 30:
+                    installed = is_mic_apk_installed(target_hint, dev=dev_snapshot)
+                if sdk is not None:
+                    self.post_gui(self._apply_probed_mic_info, dev_key, sdk, installed)
+            finally:
+                with _DEV_MIC_CACHE_LOCK:
+                    _DEV_PROBE_INFLIGHT.discard(dev_key)
+
+        threading.Thread(target=_probe, daemon=True).start()
+
+    def _on_mic_apk_button(self, dev):
+        if not dev:
+            return
+        sync_dev_mic_caches(dev)
+        if dev.get("mic_apk_installed"):
+            self.start_control_session(dev, display_id=0, turn_screen_off=None, audio_source="mic")
+        else:
+            self.install_mic_apk_for_device(dev)
+
+    def _prompt_install_mic_and_launch(self, dev, display_id=0, turn_screen_off=False):
+        sdk = dev.get("android_sdk", "?")
+        resp = messagebox.askyesno(
+            "Instalar MicrofonoADB",
+            f"{dev['name']} usa Android < 11 (SDK {sdk}).\n\n"
+            "Para escuchar el sonido físico por el micrófono se requiere la mini app 'MicrofonoADB'.\n\n"
+            "¿Deseas instalarla automáticamente ahora y abrir la pantalla con micrófono?"
+        )
+        if resp:
+            self.install_mic_apk_for_device(dev, relaunch_args=(display_id, turn_screen_off, "mic"))
+
+    def install_mic_apk_for_device(self, dev, relaunch_args=None):
+        """Instala MicrofonoADB.apk en segundo plano sobre un dispositivo Android < 11."""
+        dev_key = dev.get("key") or dev.get("ip") or dev.get("serial")
+        if not dev_key or dev_key in self._installing_mic_keys:
+            return
+
+        if not os.path.exists(MIC_APK_PATH):
+            messagebox.showerror("APK No Encontrado", f"No se encontró el archivo:\n{MIC_APK_PATH}")
+            return
+
+        self._installing_mic_keys.add(dev_key)
+        row_info = self.device_rows.get(dev_key)
+        if row_info:
+            self._refresh_mic_apk_button(row_info.get("btn_mic_apk"), dev, dev_key)
+
+        target_hint = dev.get("serial") or (f"{dev.get('ip')}:{dev.get('port')}" if dev.get("port") else dev.get("ip"))
+        self.set_status(f"Instalando MicrofonoADB.apk en {dev['name']}...")
+
+        def _worker():
+            ok, detail = install_mic_apk_on_device(target_hint, dev=dev)
+            def _finish():
+                self._installing_mic_keys.discard(dev_key)
+                cur_row = self.device_rows.get(dev_key)
+                cur_dev = cur_row["dev"] if cur_row else dev
+                if ok:
+                    cur_dev["mic_apk_installed"] = True
+                if cur_row:
+                    self._refresh_mic_apk_button(cur_row.get("btn_mic_apk"), cur_dev, dev_key)
+                if ok:
+                    self.set_status(f"¡MicrofonoADB instalado en {cur_dev['name']}! Listo para escuchar audio.")
+                    if relaunch_args:
+                        d_id, scr_off, a_src = relaunch_args
+                        self.start_control_session(cur_dev, display_id=d_id, turn_screen_off=scr_off, audio_source=a_src)
+                    else:
+                        messagebox.showinfo(
+                            "MicrofonoADB Instalado",
+                            f"La mini app se instaló correctamente en {cur_dev['name']}.\n\n"
+                            "Ahora haz clic en '🎙 Escuchar Mic' (o en 'Pantalla ▾ -> 🎙 Pantalla (Audio por Micrófono)') para escuchar sus sonidos."
+                        )
+                else:
+                    self.set_status(f"Error al instalar MicrofonoADB en {cur_dev['name']}.")
+                    messagebox.showerror("Error de Instalación", f"No se pudo instalar MicrofonoADB en {cur_dev['name']}:\n{detail}")
+            self.post_gui(_finish)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def start_control_session(self, dev, display_id=0, turn_screen_off=None, audio_source=None):
         """Inicia el control remoto en ventana normal (minimizables y maximizables). Conecta por ADB si es necesario."""
+        dev = self._get_row_dev(dev.get("key"), dev)
         if turn_screen_off is None:
             turn_screen_off = bool(getattr(self, "screen_off_var", None) and self.screen_off_var.get())
 
@@ -4066,16 +5061,28 @@ class RealTimeMultiADBApp:
                 pass
 
         if is_already_active:
-            launch_remote_control(resolved, display_id=display_id, device_name=dev["name"], dev=dev, turn_screen_off=turn_screen_off)
+            if audio_source == "mic":
+                sync_dev_mic_caches(dev)
+                sdk = dev.get("android_sdk")
+                if sdk is None:
+                    sdk = get_device_android_sdk(resolved, dev=dev)
+                if sdk is not None and sdk < 30:
+                    installed = dev.get("mic_apk_installed")
+                    if installed is None:
+                        installed = is_mic_apk_installed(resolved, dev=dev)
+                    if not installed:
+                        self._prompt_install_mic_and_launch(dev, display_id=display_id, turn_screen_off=turn_screen_off)
+                        return
+            launch_remote_control(resolved, display_id=display_id, device_name=dev["name"], dev=dev, turn_screen_off=turn_screen_off, audio_source=audio_source)
             self.root.after(350, self.hide_to_background)
         else:
             if not dev.get("is_port_open"):
                 messagebox.showwarning("No Disponible", f"{dev['name']} se encuentra fuera de esta red o no tiene el puerto ADB abierto.")
                 return
             self.set_status(f"Conectando ADB a {dev['name']} ({dev['ip']})...")
-            threading.Thread(target=self._auto_connect_and_launch, args=(dev, display_id, turn_screen_off), daemon=True).start()
+            threading.Thread(target=self._auto_connect_and_launch, args=(dev, display_id, turn_screen_off, audio_source), daemon=True).start()
 
-    def _auto_connect_and_launch(self, dev, display_id, turn_screen_off=False):
+    def _auto_connect_and_launch(self, dev, display_id, turn_screen_off=False, audio_source=None):
         dev_key = dev["key"]
         ip = dev["ip"]
         row_info = self.device_rows.get(dev_key)
@@ -4089,9 +5096,16 @@ class RealTimeMultiADBApp:
             dev["serial"] = detail
             if model:
                 dev["name"] = model
-            self.post_gui(self._update_row_state_by_key, dev_key, dev)
             resolved = resolve_active_adb_target(detail, dev=dev)
-            self.post_gui(launch_remote_control, resolved, display_id, dev["name"], dev, turn_screen_off)
+            if audio_source == "mic":
+                sdk = get_device_android_sdk(resolved, dev=dev)
+                if sdk is not None and sdk < 30:
+                    is_mic_apk_installed(resolved, dev=dev)
+            self.post_gui(self._update_row_state_by_key, dev_key, dev)
+            if audio_source == "mic" and dev.get("android_sdk") is not None and dev.get("android_sdk") < 30 and not dev.get("mic_apk_installed"):
+                self.post_gui(self._prompt_install_mic_and_launch, dev, display_id, turn_screen_off)
+                return
+            self.post_gui(launch_remote_control, resolved, display_id, dev["name"], dev, turn_screen_off, audio_source)
             self.root.after(450, self.hide_to_background)
         else:
             open_now = check_tcp_ports_fast(ip, [5555, 7888])
@@ -4263,7 +5277,95 @@ class RealTimeMultiADBApp:
         self.status_var.set("Todos los dispositivos ADB Wi-Fi han sido desconectados.")
         messagebox.showinfo("Desconectado", "Se han cerrado todas las conexiones ADB por Wi-Fi.")
 
+_SINGLE_INSTANCE_MUTEX_NAME = "Local\\MultiADBWifiBot_SingleInstance_Mutex_v1"
+_SHOW_WINDOW_EVENT_NAME = "Local\\MultiADBWifiBot_ShowWindow_Event_v1"
+_APP_WINDOW_TITLE = "Administrador de Dispositivos Wi-Fi y USB (Organizado por Red)"
+_SINGLE_INSTANCE_MUTEX_HANDLE = None
+_SHOW_WINDOW_EVENT_HANDLE = None
+_SINGLE_INSTANCE_K32 = None
+
+
+def acquire_single_instance_lock():
+    """Garantiza una única instancia en ejecución; si ya existe otra, restaura/trae al frente su ventana."""
+    global _SINGLE_INSTANCE_MUTEX_HANDLE, _SHOW_WINDOW_EVENT_HANDLE, _SINGLE_INSTANCE_K32
+    if os.name != "nt":
+        return True
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+    k32.CreateMutexW.restype = ctypes.c_void_p
+    k32.CreateEventW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_wchar_p]
+    k32.CreateEventW.restype = ctypes.c_void_p
+    k32.OpenEventW.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_wchar_p]
+    k32.OpenEventW.restype = ctypes.c_void_p
+    k32.SetEvent.argtypes = [ctypes.c_void_p]
+    k32.SetEvent.restype = ctypes.c_int
+    k32.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    k32.WaitForSingleObject.restype = ctypes.c_uint32
+    k32.CloseHandle.argtypes = [ctypes.c_void_p]
+    k32.CloseHandle.restype = ctypes.c_int
+    _SINGLE_INSTANCE_K32 = k32
+
+    ctypes.set_last_error(0)
+    h_mutex = k32.CreateMutexW(None, 0, _SINGLE_INSTANCE_MUTEX_NAME)
+    err = ctypes.get_last_error()
+    if not h_mutex:
+        return True
+
+    if err == 183:  # ERROR_ALREADY_EXISTS
+        try:
+            k32.CloseHandle(h_mutex)
+        except Exception:
+            pass
+        h_evt = k32.OpenEventW(0x0002, 0, _SHOW_WINDOW_EVENT_NAME)  # EVENT_MODIFY_STATE
+        if h_evt:
+            try:
+                k32.SetEvent(h_evt)
+            finally:
+                k32.CloseHandle(h_evt)
+        else:
+            try:
+                u32 = ctypes.WinDLL("user32", use_last_error=False)
+                u32.FindWindowW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
+                u32.FindWindowW.restype = ctypes.c_void_p
+                hwnd = u32.FindWindowW(None, _APP_WINDOW_TITLE)
+                if hwnd:
+                    u32.ShowWindow(hwnd, 9)  # SW_RESTORE
+                    u32.SetForegroundWindow(hwnd)
+            except Exception:
+                pass
+        return False
+
+    _SINGLE_INSTANCE_MUTEX_HANDLE = h_mutex
+    _SHOW_WINDOW_EVENT_HANDLE = k32.CreateEventW(None, 0, 0, _SHOW_WINDOW_EVENT_NAME)
+    return True
+
+
+def release_single_instance_lock():
+    """Libera los objetos Mutex/Event al cerrar la única instancia."""
+    global _SINGLE_INSTANCE_MUTEX_HANDLE, _SHOW_WINDOW_EVENT_HANDLE
+    k32 = _SINGLE_INSTANCE_K32
+    if k32:
+        if _SHOW_WINDOW_EVENT_HANDLE:
+            try:
+                k32.CloseHandle(_SHOW_WINDOW_EVENT_HANDLE)
+            except Exception:
+                pass
+            _SHOW_WINDOW_EVENT_HANDLE = None
+        if _SINGLE_INSTANCE_MUTEX_HANDLE:
+            try:
+                k32.CloseHandle(_SINGLE_INSTANCE_MUTEX_HANDLE)
+            except Exception:
+                pass
+            _SINGLE_INSTANCE_MUTEX_HANDLE = None
+
+
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = RealTimeMultiADBApp(root)
-    root.mainloop()
+    if not acquire_single_instance_lock():
+        sys.exit(0)
+    try:
+        root = tk.Tk()
+        app = RealTimeMultiADBApp(root)
+        root.mainloop()
+    finally:
+        release_single_instance_lock()
