@@ -13,6 +13,7 @@ import re
 import time
 import json
 import ctypes
+import atexit
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 import string
@@ -28,6 +29,150 @@ try:
     import winsound
 except ImportError:
     winsound = None
+
+# ==============================================================================
+# REGISTRO DE SUBPROCESOS: AL CERRAR EL PROGRAMA SE TERMINAN TODOS
+# (ventanas de Scrcpy, puentes de audio/micrófono, comandos adb en curso, etc.)
+# ==============================================================================
+
+_OriginalPopen = subprocess.Popen
+_CHILD_PROCS = set()
+_CHILD_PROCS_LOCK = threading.Lock()
+_APP_SHUTTING_DOWN = threading.Event()
+_KILL_JOB = None  # (kernel32, handle) del Job Object de Windows
+
+
+def _create_kill_on_close_job():
+    """Crea un Job Object de Windows con KILL_ON_JOB_CLOSE: si este programa termina
+    por cualquier motivo (incluso cerrado a la fuerza), Windows cierra los procesos asignados."""
+    if os.name != "nt":
+        return None
+    try:
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.restype = wintypes.HANDLE
+        k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        k32.SetInformationJobObject.restype = wintypes.BOOL
+        k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        k32.AssignProcessToJobObject.restype = wintypes.BOOL
+        k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        class _BASIC(ctypes.Structure):
+            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64),
+                        ("PerJobUserTimeLimit", ctypes.c_int64),
+                        ("LimitFlags", wintypes.DWORD),
+                        ("MinimumWorkingSetSize", ctypes.c_size_t),
+                        ("MaximumWorkingSetSize", ctypes.c_size_t),
+                        ("ActiveProcessLimit", wintypes.DWORD),
+                        ("Affinity", ctypes.c_size_t),
+                        ("PriorityClass", wintypes.DWORD),
+                        ("SchedulingClass", wintypes.DWORD)]
+
+        class _IO(ctypes.Structure):
+            _fields_ = [(n, ctypes.c_uint64) for n in (
+                "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+        class _EXTENDED(ctypes.Structure):
+            _fields_ = [("BasicLimitInformation", _BASIC),
+                        ("IoInfo", _IO),
+                        ("ProcessMemoryLimit", ctypes.c_size_t),
+                        ("JobMemoryLimit", ctypes.c_size_t),
+                        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                        ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+        job = k32.CreateJobObjectW(None, None)
+        if not job:
+            return None
+        info = _EXTENDED()
+        info.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):
+            k32.CloseHandle(job)
+            return None
+        return (k32, job)
+    except Exception:
+        return None
+
+
+def _is_scrcpy_command(args, kwargs):
+    cmd = kwargs.get("args", args[0] if args else None)
+    try:
+        first = cmd if isinstance(cmd, str) else cmd[0]
+        return "scrcpy" in os.path.basename(str(first)).lower()
+    except Exception:
+        return False
+
+
+def _kill_process_tree(proc):
+    """Termina un subproceso junto con los procesos hijos que haya lanzado."""
+    try:
+        if proc.poll() is not None:
+            return
+    except Exception:
+        pass
+    if os.name == "nt":
+        try:
+            _OriginalPopen(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           creationflags=subprocess.CREATE_NO_WINDOW).wait(timeout=4)
+        except Exception:
+            pass
+    try:
+        proc.kill()
+    except Exception:
+        pass
+
+
+class _TrackedPopen(_OriginalPopen):
+    """Popen que registra cada subproceso lanzado por el programa para cerrarlo al salir."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if kwargs.get("shell"):
+            # Comandos de shell (p. ej. abrir el Explorador de Windows) no pertenecen a la app
+            return
+        with _CHILD_PROCS_LOCK:
+            for p in list(_CHILD_PROCS):
+                if p.returncode is not None:
+                    _CHILD_PROCS.discard(p)
+            _CHILD_PROCS.add(self)
+        if _KILL_JOB and _is_scrcpy_command(args, kwargs):
+            try:
+                k32, job = _KILL_JOB
+                k32.AssignProcessToJobObject(job, int(self._handle))
+            except Exception:
+                pass
+        if _APP_SHUTTING_DOWN.is_set():
+            _kill_process_tree(self)
+
+
+def terminate_all_child_processes():
+    """Cierra todas las ventanas de Scrcpy y demás subprocesos abiertos por el programa.
+    No detiene el servidor global de adb."""
+    global _KILL_JOB
+    _APP_SHUTTING_DOWN.set()
+    with _CHILD_PROCS_LOCK:
+        procs = list(_CHILD_PROCS)
+        _CHILD_PROCS.clear()
+    workers = [threading.Thread(target=_kill_process_tree, args=(p,), daemon=True) for p in procs]
+    for w in workers:
+        w.start()
+    deadline = time.time() + 5
+    for w in workers:
+        w.join(max(0.0, deadline - time.time()))
+    if _KILL_JOB:
+        try:
+            k32, job = _KILL_JOB
+            k32.CloseHandle(job)  # Windows cierra cualquier Scrcpy que siga vivo
+        except Exception:
+            pass
+        _KILL_JOB = None
+
+
+_KILL_JOB = _create_kill_on_close_job()
+subprocess.Popen = _TrackedPopen
+atexit.register(terminate_all_child_processes)
 
 # ==============================================================================
 # CONSTANTES Y BASE DE DATOS LOCAL DE DISPOSITIVOS CONOCIDOS / ESTÁTICOS
@@ -1243,7 +1388,7 @@ def launch_remote_control(serial_or_ip, display_id=0, device_name="", dev=None, 
                 start_kds_alarm_sound_bridge(resolved_target, scrcpy_proc=proc, device_name=name_clean)
             try:
                 ret = proc.wait(timeout=2.0)
-                if ret != 0:
+                if ret != 0 and not _APP_SHUTTING_DOWN.is_set():
                     err_lines = proc.stderr.read()
                     err_msg = err_lines.strip().splitlines()[-1] if err_lines.strip() else f"Código de salida: {ret}"
                     messagebox.showerror("Error en Pantalla", f"No se pudo proyectar la pantalla de {name_clean}:\n{err_msg}")
@@ -2351,8 +2496,20 @@ class RealTimeMultiADBApp:
 
     def _on_closing(self):
         self._stop_watcher.set()
-        close_all_legacy_mic_players()
-        self.root.destroy()
+        _APP_SHUTTING_DOWN.set()
+        try:
+            self.root.withdraw()
+        except Exception:
+            pass
+        try:
+            close_all_legacy_mic_players()
+        except Exception:
+            pass
+        terminate_all_child_processes()
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
 
     def post_gui(self, fn, *args, **kwargs):
         self.msg_queue.put((fn, args, kwargs))
@@ -5368,4 +5525,7 @@ if __name__ == "__main__":
         app = RealTimeMultiADBApp(root)
         root.mainloop()
     finally:
+        terminate_all_child_processes()
         release_single_instance_lock()
+        # Salida total: no deja hilos ni procesos internos vivos hasta volver a abrir el programa
+        os._exit(0)
