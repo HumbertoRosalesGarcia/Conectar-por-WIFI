@@ -4251,9 +4251,49 @@ class RealTimeMultiADBApp:
         def _qr_worker(srv_name, pwd):
             cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
             target_ip = dev.get("ip", "") if dev else ""
-            subnet_prefix = ".".join(pc_ip.split(".")[:3]) + "." if pc_ip else "192.168.1."
-            already_paired = [False]
 
+            def _set_status(text, color):
+                self.post_gui(lambda t=text, c=color: qr_status_lbl.config(text=t, foreground=c))
+
+            def _close_zc(zc_inst):
+                if zc_inst:
+                    try:
+                        zc_inst.close()
+                    except Exception:
+                        pass
+                if current_zeroconf[0] is zc_inst:
+                    current_zeroconf[0] = None
+
+            # --- Descubrimiento mDNS con el propio ADB (mismo método que Android Studio) ---
+            mdns_re = re.compile(r"^(\S+)\s+(_adb-tls-(?:pairing|connect)\._tcp)\.?\s+(\d{1,3}(?:\.\d{1,3}){3}):(\d+)")
+
+            def _adb_mdns_services():
+                """Devuelve lista de (instancia, tipo, ip, puerto) desde 'adb mdns services'."""
+                found = []
+                try:
+                    res = subprocess.run(["adb", "mdns", "services"], capture_output=True, text=True,
+                                         errors="replace", creationflags=cflags, timeout=4)
+                    for line in (res.stdout or "").splitlines():
+                        m = mdns_re.match(line.strip())
+                        if m:
+                            found.append((m.group(1), m.group(2), m.group(3), int(m.group(4))))
+                except Exception:
+                    pass
+                return found
+
+            def _run_pair(ip_addr, port):
+                """Ejecuta adb pair. Solo se considera éxito si adb responde 'Successfully paired'."""
+                try:
+                    res = subprocess.run(["adb", "pair", f"{ip_addr}:{port}", pwd], capture_output=True,
+                                         text=True, errors="replace", creationflags=cflags, timeout=10)
+                    out = (res.stdout + res.stderr).strip()
+                except subprocess.TimeoutExpired:
+                    return False, "Tiempo de espera agotado en adb pair"
+                except Exception as e:
+                    return False, str(e)
+                return ("successfully paired" in out.lower()), out
+
+            # --- Escucha mDNS con zeroconf (respaldo del anterior) ---
             class PairingListener:
                 def __init__(self):
                     self.ip = None
@@ -4261,19 +4301,15 @@ class RealTimeMultiADBApp:
 
                 def _resolve(self, zc, type_, name):
                     try:
+                        # El teléfono publica el servicio de vinculación con el nombre exacto del QR
+                        if srv_name.lower() not in name.lower():
+                            return
                         info = zc.get_service_info(type_, name, timeout=2500)
                         if info:
-                            addresses = info.parsed_addresses()
-                            if addresses:
-                                ip_found = addresses[0]
-                                is_match = (
-                                    srv_name.lower() in name.lower()
-                                    or (target_ip and ip_found == target_ip)
-                                    or ip_found.startswith(subnet_prefix)
-                                )
-                                if is_match and not self.ip:
-                                    self.ip = ip_found
-                                    self.port = info.port
+                            addresses = [a for a in info.parsed_addresses() if "." in a]
+                            if addresses and not self.ip:
+                                self.ip = addresses[0]
+                                self.port = info.port
                     except Exception:
                         pass
 
@@ -4299,24 +4335,10 @@ class RealTimeMultiADBApp:
                 except Exception:
                     pass
 
-            # Lista de IPs candidatas de la red por si el router bloquea mDNS
-            candidate_ips = []
-            if target_ip:
-                candidate_ips.append(target_ip)
-            for prio_ip in ["192.168.1.5", "192.168.1.78", "192.168.1.77"]:
-                if prio_ip not in candidate_ips and prio_ip != pc_ip:
-                    candidate_ips.append(prio_ip)
-            for r_k, r_info in list(self.device_rows.items()):
-                r_dev = r_info.get("dev", {})
-                r_ip = r_dev.get("ip", "")
-                if r_ip and r_ip != pc_ip and not r_dev.get("is_router") and not r_dev.get("is_local_or_router"):
-                    if r_ip not in candidate_ips:
-                        candidate_ips.append(r_ip)
-
-            def _scan_ephemeral_ports(ip_addr, port_range=range(30000, 52000), timeout_s=0.03):
+            def _scan_ephemeral_ports(ip_addr, port_range=range(30000, 61000), timeout_s=0.025, stop_fn=None):
                 open_ports = []
                 def _chk(p):
-                    if stop_qr_event.is_set() or listener.ip:
+                    if stop_qr_event.is_set() or (stop_fn and stop_fn()):
                         return None
                     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                     s.settimeout(timeout_s)
@@ -4338,91 +4360,88 @@ class RealTimeMultiADBApp:
                             open_ports.append(res_p)
                 return open_ports
 
-            failed_pair_ports = set()
-            start_t = time.time()
+            # Estado compartido de la vinculación (un solo 'adb pair' a la vez)
+            pair_state = {"ip": None, "port": None, "paired": False, "last_error": ""}
+            pair_lock = threading.Lock()
 
-            while not stop_qr_event.is_set() and listener.ip is None and (time.time() - start_t) < 90:
-                # Sondeo activo ultrarrápido de puertos dinámicos (30000-52000) para garantizar detección sin depender de mDNS
-                for c_ip in candidate_ips:
-                    if stop_qr_event.is_set() or listener.ip:
-                        break
-                    # Verificar primero si la IP responde o está activa
-                    open_p_list = _scan_ephemeral_ports(c_ip, range(30000, 52000), timeout_s=0.025)
-                    for p_cand in open_p_list:
-                        if stop_qr_event.is_set() or listener.ip:
-                            break
-                        if (c_ip, p_cand) in failed_pair_ports:
-                            continue
-                        try:
-                            self.post_gui(lambda ip_=c_ip, pt_=p_cand: qr_status_lbl.config(
-                                text=f"🔄 Puerto detectado ({ip_}:{pt_})! Vinculando...",
-                                foreground="#b36b00"
-                            ))
-                            pair_try = subprocess.run(
-                                ["adb", "pair", f"{c_ip}:{p_cand}", pwd],
-                                capture_output=True, text=True, creationflags=cflags, timeout=30
-                            )
-                            out_str = (pair_try.stdout + pair_try.stderr).lower()
-                            if "successfully paired" in out_str or pair_try.returncode == 0:
-                                listener.ip = c_ip
-                                listener.port = p_cand
-                                already_paired[0] = True
-                                break
-                            else:
-                                failed_pair_ports.add((c_ip, p_cand))
-                        except Exception:
-                            failed_pair_ports.add((c_ip, p_cand))
-                if not listener.ip:
-                    time.sleep(0.2)
+            def _try_pair(ip_addr, port):
+                with pair_lock:
+                    if pair_state["paired"] or stop_qr_event.is_set():
+                        return pair_state["paired"]
+                    _set_status(f"🔄 ¡Detectado ({ip_addr}:{port})! Vinculando...", "#b36b00")
+                    ok, out = _run_pair(ip_addr, port)
+                    if ok:
+                        pair_state.update(ip=ip_addr, port=port, paired=True)
+                    else:
+                        pair_state["last_error"] = out
+                        _set_status("⏳ Esperando escaneo con la cámara del teléfono...", "#0066cc")
+                    return ok
+
+            # Respaldo: sondeo de puertos en IPs conocidas por si el router bloquea mDNS.
+            # Corre en otro hilo para no frenar la detección por mDNS.
+            candidate_ips = []
+            if target_ip and target_ip != pc_ip:
+                candidate_ips.append(target_ip)
+            for r_k, r_info in list(self.device_rows.items()):
+                r_dev = r_info.get("dev", {})
+                r_ip = r_dev.get("ip", "")
+                if r_ip and r_ip != pc_ip and not r_dev.get("is_router") and not r_dev.get("is_local_or_router"):
+                    if r_ip not in candidate_ips:
+                        candidate_ips.append(r_ip)
+
+            def _scan_fallback_worker():
+                tried = set()
+                is_done = lambda: pair_state["paired"]
+                while not stop_qr_event.is_set() and not is_done() and (time.time() - start_t) < 90:
+                    for c_ip in candidate_ips:
+                        if stop_qr_event.is_set() or is_done():
+                            return
+                        for p_cand in _scan_ephemeral_ports(c_ip, stop_fn=is_done):
+                            if stop_qr_event.is_set() or is_done():
+                                return
+                            if (c_ip, p_cand) in tried:
+                                continue
+                            tried.add((c_ip, p_cand))
+                            _try_pair(c_ip, p_cand)
+                    time.sleep(1.0)
+
+            start_t = time.time()
+            if candidate_ips:
+                threading.Thread(target=_scan_fallback_worker, daemon=True).start()
+
+            # Bucle principal: busca el servicio de vinculación con el nombre del QR
+            mdns_tried = set()
+            while not stop_qr_event.is_set() and not pair_state["paired"] and (time.time() - start_t) < 90:
+                endpoints = []
+                for inst, svc, s_ip, s_port in _adb_mdns_services():
+                    if svc.startswith("_adb-tls-pairing") and srv_name.lower() in inst.lower():
+                        endpoints.append((s_ip, s_port))
+                if listener.ip and listener.port:
+                    endpoints.append((listener.ip, listener.port))
+                for ep in endpoints:
+                    if ep in mdns_tried or pair_state["paired"]:
+                        continue
+                    mdns_tried.add(ep)
+                    _try_pair(ep[0], ep[1])
+                if not pair_state["paired"]:
+                    time.sleep(1.0)
 
             if stop_qr_event.is_set():
-                if zc:
-                    try:
-                        zc.close()
-                    except Exception:
-                        pass
+                _close_zc(zc)
                 return
 
-            if not listener.ip or not listener.port:
-                self.post_gui(lambda: qr_status_lbl.config(
-                    text="⚠ Tiempo agotado. Pulsa 'Generar nuevo QR' o usa la Opción B de la derecha.",
-                    foreground="#cc3300"
-                ))
-                if zc:
-                    try:
-                        zc.close()
-                    except Exception:
-                        pass
+            if not pair_state["paired"]:
+                _close_zc(zc)
+                if pair_state["last_error"]:
+                    _set_status(f"❌ Error al vincular: {pair_state['last_error']}\nPulsa 'Generar nuevo QR' o usa la Opción B.", "#cc0000")
+                else:
+                    _set_status("⚠ Tiempo agotado. Pulsa 'Generar nuevo QR' o usa la Opción B de la derecha.", "#cc3300")
                 return
 
-            pair_ip = listener.ip
-            pair_port = listener.port
+            pair_ip = pair_state["ip"]
+            pair_port = pair_state["port"]
 
-            if not already_paired[0]:
-                self.post_gui(lambda: qr_status_lbl.config(
-                    text=f"🔄 ¡Detectado ({pair_ip}:{pair_port})! Vinculando de inmediato...",
-                    foreground="#b36b00"
-                ))
-                pair_ep = f"{pair_ip}:{pair_port}"
-                res = subprocess.run(["adb", "pair", pair_ep, pwd], capture_output=True, text=True, creationflags=cflags, timeout=10)
-                pair_out = (res.stdout + res.stderr).strip()
-
-                if "successfully paired" not in pair_out.lower() and res.returncode != 0:
-                    self.post_gui(lambda: qr_status_lbl.config(
-                        text=f"❌ Error al vincular: {pair_out}",
-                        foreground="#cc0000"
-                    ))
-                    if zc:
-                        try:
-                            zc.close()
-                        except Exception:
-                            pass
-                    return
-
-            self.post_gui(lambda: qr_status_lbl.config(
-                text="✔ ¡Vinculado con éxito! Buscando puerto de conexión...",
-                foreground="#196f3d"
-            ))
+            _set_status("✔ ¡Vinculado con éxito! Buscando puerto de conexión...", "#196f3d")
 
             class ConnectListener:
                 def __init__(self, t_ip):
@@ -4434,7 +4453,7 @@ class RealTimeMultiADBApp:
                         info = zc_inst.get_service_info(type_, name, timeout=2000)
                         if info:
                             addresses = info.parsed_addresses()
-                            if addresses and addresses[0] == self.target_ip:
+                            if self.target_ip in addresses:
                                 self.port = info.port
                     except Exception:
                         pass
@@ -4455,83 +4474,101 @@ class RealTimeMultiADBApp:
                 except Exception:
                     pass
 
-            # Esperar brevemente mDNS o escanear activamente el puerto de conexión en pair_ip
+            def _adb_connect(port):
+                try:
+                    res = subprocess.run(["adb", "connect", f"{pair_ip}:{port}"], capture_output=True, text=True,
+                                         errors="replace", creationflags=cflags, timeout=8)
+                    out = (res.stdout + res.stderr).strip()
+                except Exception as e:
+                    return False, str(e)
+                low = out.lower()
+                ok = "connected to" in low and "failed" not in low and "cannot" not in low and "unable" not in low
+                return ok, out
+
+            # Buscar el puerto de conexión: mDNS de ADB, luego zeroconf, y como último recurso sondeo de puertos
             c_start = time.time()
             connect_port = None
-            while not stop_qr_event.is_set() and not connect_port and (time.time() - c_start) < 12:
+            conn_out = ""
+            tried_conn = set()
+            last_scan = 0.0
+            while not stop_qr_event.is_set() and not connect_port and (time.time() - c_start) < 20:
+                cands = []
+                for inst, svc, s_ip, s_port in _adb_mdns_services():
+                    if svc.startswith("_adb-tls-connect") and s_ip == pair_ip:
+                        cands.append(s_port)
                 if c_listener.port:
-                    connect_port = c_listener.port
-                    break
-                open_conn_ports = _scan_ephemeral_ports(pair_ip, range(30000, 52000), timeout_s=0.025)
-                for cp in open_conn_ports:
-                    if cp != pair_port:
+                    cands.append(c_listener.port)
+                if not cands and (time.time() - c_start) > 4 and (time.time() - last_scan) > 4:
+                    last_scan = time.time()
+                    cands.extend(p for p in _scan_ephemeral_ports(pair_ip) if p != pair_port)
+                for cp in cands:
+                    if cp in tried_conn or stop_qr_event.is_set():
+                        continue
+                    tried_conn.add(cp)
+                    _set_status(f"🚀 Conectando ADB a {pair_ip}:{cp}...", "#196f3d")
+                    ok, conn_out = _adb_connect(cp)
+                    if ok:
                         connect_port = cp
                         break
                 if not connect_port:
-                    time.sleep(0.3)
+                    time.sleep(1.0)
 
-            if zc:
-                try:
-                    zc.close()
-                except Exception:
-                    pass
+            _close_zc(zc)
 
-            if not connect_port and dev and dev.get("port"):
-                connect_port = int(dev["port"])
-
-            if not connect_port:
-                open_check = check_tcp_ports_fast(pair_ip, [5555, 7888], timeout=1.0)
-                if open_check:
-                    connect_port = int(open_check[0])
-
-            if not connect_port:
-                self.post_gui(lambda: qr_status_lbl.config(
-                    text="✔ ¡Dispositivo vinculado con éxito!\nIngresa el puerto en 'Conectar por Puerto' para finalizar.",
-                    foreground="#196f3d"
-                ))
+            if stop_qr_event.is_set():
                 return
 
-            self.post_gui(lambda: qr_status_lbl.config(
-                text=f"🚀 Conectando ADB a {pair_ip}:{connect_port}...",
-                foreground="#196f3d"
-            ))
-
-            conn_res = subprocess.run(["adb", "connect", f"{pair_ip}:{connect_port}"], capture_output=True, text=True, errors="replace", creationflags=cflags, timeout=8)
-            conn_out = (conn_res.stdout + conn_res.stderr).strip()
-
-            if "connected to" in conn_out.lower():
-                self.post_gui(lambda: qr_status_lbl.config(
-                    text=f"🎉 ¡Dispositivo vinculado y conectado exitosamente en {pair_ip}:{connect_port}!",
-                    foreground="#196f3d"
-                ))
-                dev_name = dev.get("name") if dev and dev.get("name") and "dispositivo" not in dev.get("name", "").lower() else f"Android ({pair_ip})"
-                save_known_device(
-                    pair_ip,
-                    name=dev_name,
-                    is_static=True,
-                    last_port=str(connect_port),
-                    network=self.current_net_name
-                )
-                if dev:
-                    dev["port"] = str(connect_port)
-                    dev["last_port"] = str(connect_port)
-                    dev["is_port_open"] = True
-                    dev["is_adb_connected"] = True
-                    self.post_gui(self._update_row_state_by_key, dev.get("key", pair_ip), dev)
-
-                def _auto_close():
+            # Últimos recursos: puerto guardado del equipo o puertos clásicos
+            if not connect_port:
+                fallback_ports = []
+                if dev and dev.get("port"):
+                    fallback_ports.append(str(dev["port"]))
+                fallback_ports.extend(check_tcp_ports_fast(pair_ip, [5555, 7888], timeout=1.0))
+                for fp in fallback_ports:
                     try:
-                        dialog.destroy()
+                        fp_int = int(fp)
                     except Exception:
-                        pass
-                    self.trigger_scan()
+                        continue
+                    if fp_int in tried_conn:
+                        continue
+                    tried_conn.add(fp_int)
+                    ok, conn_out = _adb_connect(fp_int)
+                    if ok:
+                        connect_port = fp_int
+                        break
 
-                self.root.after(1200, _auto_close)
-            else:
-                self.post_gui(lambda: qr_status_lbl.config(
-                    text=f"Vinculado con éxito. Error conectando: {conn_out}",
-                    foreground="#cc3300"
-                ))
+            if not connect_port:
+                if conn_out:
+                    _set_status(f"Vinculado con éxito. Error conectando: {conn_out}\nIngresa el puerto en 'Conectar por Puerto' para finalizar.", "#cc3300")
+                else:
+                    _set_status("✔ ¡Dispositivo vinculado con éxito!\nIngresa el puerto en 'Conectar por Puerto' para finalizar.", "#196f3d")
+                return
+
+            _set_status(f"🎉 ¡Dispositivo vinculado y conectado exitosamente en {pair_ip}:{connect_port}!", "#196f3d")
+
+            dev_name = dev.get("name") if dev and dev.get("name") and "dispositivo" not in dev.get("name", "").lower() else f"Android ({pair_ip})"
+            save_known_device(
+                pair_ip,
+                name=dev_name,
+                is_static=True,
+                last_port=str(connect_port),
+                network=self.current_net_name
+            )
+            if dev:
+                dev["port"] = str(connect_port)
+                dev["last_port"] = str(connect_port)
+                dev["is_port_open"] = True
+                dev["is_adb_connected"] = True
+                self.post_gui(self._update_row_state_by_key, dev.get("key", pair_ip), dev)
+
+            def _auto_close():
+                try:
+                    dialog.destroy()
+                except Exception:
+                    pass
+                self.trigger_scan()
+
+            self.post_gui(lambda: self.root.after(1200, _auto_close))
 
         # Iniciar sesión QR automáticamente al abrir el diálogo
         start_qr_session()
