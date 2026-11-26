@@ -13,6 +13,7 @@ import re
 import time
 import json
 import ctypes
+import atexit
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 import string
@@ -28,6 +29,150 @@ try:
     import winsound
 except ImportError:
     winsound = None
+
+# ==============================================================================
+# REGISTRO DE SUBPROCESOS: AL CERRAR EL PROGRAMA SE TERMINAN TODOS
+# (ventanas de Scrcpy, puentes de audio/micrófono, comandos adb en curso, etc.)
+# ==============================================================================
+
+_OriginalPopen = subprocess.Popen
+_CHILD_PROCS = set()
+_CHILD_PROCS_LOCK = threading.Lock()
+_APP_SHUTTING_DOWN = threading.Event()
+_KILL_JOB = None  # (kernel32, handle) del Job Object de Windows
+
+
+def _create_kill_on_close_job():
+    """Crea un Job Object de Windows con KILL_ON_JOB_CLOSE: si este programa termina
+    por cualquier motivo (incluso cerrado a la fuerza), Windows cierra los procesos asignados."""
+    if os.name != "nt":
+        return None
+    try:
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.restype = wintypes.HANDLE
+        k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        k32.SetInformationJobObject.restype = wintypes.BOOL
+        k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        k32.AssignProcessToJobObject.restype = wintypes.BOOL
+        k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+        class _BASIC(ctypes.Structure):
+            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64),
+                        ("PerJobUserTimeLimit", ctypes.c_int64),
+                        ("LimitFlags", wintypes.DWORD),
+                        ("MinimumWorkingSetSize", ctypes.c_size_t),
+                        ("MaximumWorkingSetSize", ctypes.c_size_t),
+                        ("ActiveProcessLimit", wintypes.DWORD),
+                        ("Affinity", ctypes.c_size_t),
+                        ("PriorityClass", wintypes.DWORD),
+                        ("SchedulingClass", wintypes.DWORD)]
+
+        class _IO(ctypes.Structure):
+            _fields_ = [(n, ctypes.c_uint64) for n in (
+                "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+        class _EXTENDED(ctypes.Structure):
+            _fields_ = [("BasicLimitInformation", _BASIC),
+                        ("IoInfo", _IO),
+                        ("ProcessMemoryLimit", ctypes.c_size_t),
+                        ("JobMemoryLimit", ctypes.c_size_t),
+                        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                        ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+        job = k32.CreateJobObjectW(None, None)
+        if not job:
+            return None
+        info = _EXTENDED()
+        info.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):
+            k32.CloseHandle(job)
+            return None
+        return (k32, job)
+    except Exception:
+        return None
+
+
+def _is_scrcpy_command(args, kwargs):
+    cmd = kwargs.get("args", args[0] if args else None)
+    try:
+        first = cmd if isinstance(cmd, str) else cmd[0]
+        return "scrcpy" in os.path.basename(str(first)).lower()
+    except Exception:
+        return False
+
+
+def _kill_process_tree(proc):
+    """Termina un subproceso junto con los procesos hijos que haya lanzado."""
+    try:
+        if proc.poll() is not None:
+            return
+    except Exception:
+        pass
+    if os.name == "nt":
+        try:
+            _OriginalPopen(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           creationflags=subprocess.CREATE_NO_WINDOW).wait(timeout=4)
+        except Exception:
+            pass
+    try:
+        proc.kill()
+    except Exception:
+        pass
+
+
+class _TrackedPopen(_OriginalPopen):
+    """Popen que registra cada subproceso lanzado por el programa para cerrarlo al salir."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if kwargs.get("shell"):
+            # Comandos de shell (p. ej. abrir el Explorador de Windows) no pertenecen a la app
+            return
+        with _CHILD_PROCS_LOCK:
+            for p in list(_CHILD_PROCS):
+                if p.returncode is not None:
+                    _CHILD_PROCS.discard(p)
+            _CHILD_PROCS.add(self)
+        if _KILL_JOB and _is_scrcpy_command(args, kwargs):
+            try:
+                k32, job = _KILL_JOB
+                k32.AssignProcessToJobObject(job, int(self._handle))
+            except Exception:
+                pass
+        if _APP_SHUTTING_DOWN.is_set():
+            _kill_process_tree(self)
+
+
+def terminate_all_child_processes():
+    """Cierra todas las ventanas de Scrcpy y demás subprocesos abiertos por el programa.
+    No detiene el servidor global de adb."""
+    global _KILL_JOB
+    _APP_SHUTTING_DOWN.set()
+    with _CHILD_PROCS_LOCK:
+        procs = list(_CHILD_PROCS)
+        _CHILD_PROCS.clear()
+    workers = [threading.Thread(target=_kill_process_tree, args=(p,), daemon=True) for p in procs]
+    for w in workers:
+        w.start()
+    deadline = time.time() + 5
+    for w in workers:
+        w.join(max(0.0, deadline - time.time()))
+    if _KILL_JOB:
+        try:
+            k32, job = _KILL_JOB
+            k32.CloseHandle(job)  # Windows cierra cualquier Scrcpy que siga vivo
+        except Exception:
+            pass
+        _KILL_JOB = None
+
+
+_KILL_JOB = _create_kill_on_close_job()
+subprocess.Popen = _TrackedPopen
+atexit.register(terminate_all_child_processes)
 
 # ==============================================================================
 # CONSTANTES Y BASE DE DATOS LOCAL DE DISPOSITIVOS CONOCIDOS / ESTÁTICOS
@@ -1243,7 +1388,7 @@ def launch_remote_control(serial_or_ip, display_id=0, device_name="", dev=None, 
                 start_kds_alarm_sound_bridge(resolved_target, scrcpy_proc=proc, device_name=name_clean)
             try:
                 ret = proc.wait(timeout=2.0)
-                if ret != 0:
+                if ret != 0 and not _APP_SHUTTING_DOWN.is_set():
                     err_lines = proc.stderr.read()
                     err_msg = err_lines.strip().splitlines()[-1] if err_lines.strip() else f"Código de salida: {ret}"
                     messagebox.showerror("Error en Pantalla", f"No se pudo proyectar la pantalla de {name_clean}:\n{err_msg}")
@@ -1669,7 +1814,281 @@ def get_usb_connected_devices():
         pass
     return usb_devs
 
-def get_adb_connected_and_mdns():
+def _build_mdns_query(qname, qtype=12, qclass=0x0001, txid=0x1234):
+    """Construye una consulta DNS-SD/mDNS estándar (RFC 6762 §6.7 Legacy Unicast)."""
+    q = struct.pack("!HHHHHH", txid & 0xFFFF, 0x0000, 1, 0, 0, 0)
+    for part in str(qname).strip(".").split("."):
+        if part:
+            b = part.encode("utf-8", errors="ignore")[:63]
+            q += bytes([len(b)]) + b
+    q += b"\x00" + struct.pack("!HH", qtype, qclass)
+    return q
+
+
+def _decode_dns_name(data, offset):
+    """Decodifica un nombre DNS con soporte de punteros de compresión RFC 1035."""
+    labels = []
+    jumped = False
+    orig_off = offset
+    seen = set()
+    n = len(data)
+    while offset < n:
+        if offset in seen:
+            break
+        seen.add(offset)
+        length = data[offset]
+        if length == 0:
+            offset += 1
+            break
+        if (length & 0xC0) == 0xC0:
+            if offset + 1 >= n:
+                offset = n
+                break
+            ptr = struct.unpack("!H", data[offset:offset + 2])[0] & 0x3FFF
+            if not jumped:
+                orig_off = offset + 2
+                jumped = True
+            offset = ptr
+        else:
+            offset += 1
+            if offset + length > n:
+                break
+            labels.append(data[offset:offset + length].decode("utf-8", errors="replace"))
+            offset += length
+    return ".".join(labels), (orig_off if jumped else offset)
+
+
+def _parse_mdns_response(data):
+    """Extrae registros PTR, SRV, A y TXT de una respuesta DNS/mDNS."""
+    if not data or len(data) < 12:
+        return []
+    try:
+        _, _, qd, an, ns, ar = struct.unpack("!HHHHHH", data[:12])
+    except Exception:
+        return []
+    off = 12
+    n = len(data)
+    for _ in range(qd):
+        if off >= n:
+            return []
+        _, off = _decode_dns_name(data, off)
+        off += 4
+    records = []
+    for _ in range(an + ns + ar):
+        if off + 10 > n:
+            break
+        name, off = _decode_dns_name(data, off)
+        if off + 10 > n:
+            break
+        rtype, _rclass, _ttl, rdlen = struct.unpack("!HHIH", data[off:off + 10])
+        off += 10
+        if off + rdlen > n:
+            break
+        roff = off
+        rdata = data[off:off + rdlen]
+        off += rdlen
+        if rtype == 12:  # PTR
+            ptr, _ = _decode_dns_name(data, roff)
+            records.append(("PTR", name, ptr))
+        elif rtype == 33 and len(rdata) >= 6:  # SRV
+            _prio, _weight, port = struct.unpack("!HHH", rdata[:6])
+            target, _ = _decode_dns_name(data, roff + 6)
+            records.append(("SRV", name, port, target))
+        elif rtype == 1 and len(rdata) >= 4:  # A
+            records.append(("A", name, socket.inet_ntoa(rdata[:4])))
+        elif rtype == 16:  # TXT
+            i = 0
+            txts = []
+            while i < len(rdata):
+                ln = rdata[i]
+                i += 1
+                if i + ln <= len(rdata):
+                    txts.append(rdata[i:i + ln].decode("utf-8", errors="replace"))
+                i += ln
+            records.append(("TXT", name, txts))
+    return records
+
+
+def query_unicast_mdns_adb(target_ips=None, service_type="_adb-tls-connect._tcp.local",
+                           local_ip="", wait_s=0.65, bursts=2, stop_event=None,
+                           use_multicast_broadcast=True, instance_name=""):
+    """
+    Consulta mDNS usando QU=1 (0x8001, RFC 6762 §5.4) + Legacy Unicast (RFC 6762 §6.7)
+    desde un puerto origen efímero local -> obliga TANTO a native mdnsd (Android 11-13 y
+    _adb-tls-connect) COMO a Java MdnsRecordRepository (Android 14-16 _adb-tls-pairing)
+    a responder por UNICAST directo a nuestro socket exclusivo.
+    Envía por 3 vías simultáneas en el mismo socket efímero:
+      1) Multicast 224.0.0.251:5353
+      2) Broadcast de subred <subnet>.255:5353
+      3) Unicast directo <ip>:5353 a target_ips
+    Retorna lista de dicts: [{"instance", "service", "ip", "port", "model"}].
+    """
+    ips = [str(ip).strip() for ip in (target_ips or []) if ip and is_valid_lan_ipv4(str(ip).strip())]
+    u_local = local_ip if (local_ip and is_valid_lan_ipv4(local_ip)) else get_wifi_adapter_ip()
+    if not ips and not use_multicast_broadcast:
+        return []
+
+    svc_clean = service_type.strip(".")
+    svc_short = svc_clean[:-6] if svc_clean.lower().endswith(".local") else svc_clean
+    # CRÍTICO para Android 14/15/16 (Java MdnsRecordRepository):
+    # getReply() SOLO responde unicast (dest = src) si el bit QU (0x8000 -> qclass=0x8001) está activo.
+    q_pkts = [
+        _build_mdns_query(svc_clean, qtype=12, qclass=0x8001, txid=0),
+        _build_mdns_query(svc_clean, qtype=12, qclass=0x0001, txid=random.randint(1, 65534)),
+    ]
+    if instance_name:
+        full_inst = f"{str(instance_name).strip('.')}.{svc_clean}"
+        # Consulta SRV directa con QU=1 -> en Android 14-16 dispara delayMs=0 (respuesta inmediata)
+        q_pkts.insert(0, _build_mdns_query(full_inst, qtype=33, qclass=0x8001, txid=0))
+
+    bcast_ip = ""
+    if u_local and is_valid_lan_ipv4(u_local):
+        bcast_ip = ".".join(u_local.split(".")[:3]) + ".255"
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        # Evitar WinError 10054 (ICMP Port Unreachable) al sondear múltiples IPs en Windows
+        if hasattr(socket, "SIO_UDP_CONNRESET"):
+            try:
+                sock.ioctl(socket.SIO_UDP_CONNRESET, False)
+            except Exception:
+                pass
+        if use_multicast_broadcast:
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            except Exception:
+                pass
+        if u_local and is_valid_lan_ipv4(u_local):
+            try:
+                sock.bind((u_local, 0))
+            except Exception:
+                sock.bind(("", 0))
+            if use_multicast_broadcast:
+                try:
+                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(u_local))
+                    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 255)
+                except Exception:
+                    pass
+        else:
+            sock.bind(("", 0))
+        sock.settimeout(0.18)
+
+        found_map = {}  # (ip, port, instance) -> dict
+        srv_requested = set()
+
+        for b_idx in range(max(1, int(bursts))):
+            if stop_event and stop_event.is_set():
+                break
+            if use_multicast_broadcast:
+                for qp in q_pkts:
+                    try:
+                        sock.sendto(qp, ("224.0.0.251", 5353))
+                    except Exception:
+                        pass
+                    if bcast_ip:
+                        try:
+                            sock.sendto(qp, (bcast_ip, 5353))
+                        except Exception:
+                            pass
+            for ip in ips:
+                if ip == u_local:
+                    continue
+                # Para consultas unicast masivas (/24), enviar los paquetes QU=1 (evita duplicar tráfico)
+                uni_pkts = q_pkts[:2] if len(ips) > 30 else q_pkts
+                for qp in uni_pkts:
+                    try:
+                        sock.sendto(qp, (ip, 5353))
+                    except Exception:
+                        pass
+
+            deadline = time.time() + (wait_s if b_idx == 0 else max(wait_s, 0.75))
+            while time.time() < deadline:
+                if stop_event and stop_event.is_set():
+                    break
+                try:
+                    data, addr = sock.recvfrom(4096)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    continue
+                sender_ip = addr[0]
+                recs = _parse_mdns_response(data)
+                if not recs:
+                    continue
+
+                ptr_names = []
+                srv_by_name = {}
+                txt_by_name = {}
+                a_by_host = {}
+                for rec in recs:
+                    rt = rec[0]
+                    if rt == "PTR":
+                        ptr_names.append(rec[2])
+                    elif rt == "SRV":
+                        srv_by_name[rec[1].lower()] = (rec[1], int(rec[2]), rec[3])
+                    elif rt == "TXT":
+                        txt_by_name[rec[1].lower()] = rec[2]
+                    elif rt == "A":
+                        a_by_host[rec[1].lower()] = rec[2]
+
+                # Si un equipo respondió solo PTR sin SRV embebido, solicitar SRV explícito con QU=1 (0x8001)
+                for pname in ptr_names:
+                    pl = pname.lower()
+                    if svc_short.lower() not in pl:
+                        continue
+                    if pl not in srv_by_name and (sender_ip, pl) not in srv_requested:
+                        srv_requested.add((sender_ip, pl))
+                        srv_q = _build_mdns_query(pname, qtype=33, qclass=0x8001, txid=0)
+                        try:
+                            sock.sendto(srv_q, (sender_ip, 5353))
+                            if use_multicast_broadcast:
+                                sock.sendto(srv_q, ("224.0.0.251", 5353))
+                                if bcast_ip:
+                                    sock.sendto(srv_q, (bcast_ip, 5353))
+                            deadline = max(deadline, time.time() + 0.5)
+                        except Exception:
+                            pass
+
+                for sl_name, (orig_name, port, host_target) in srv_by_name.items():
+                    if svc_short.lower() not in sl_name or not (1 <= port <= 65535):
+                        continue
+                    inst = orig_name.split(".", 1)[0]
+                    resolved_ip = a_by_host.get(host_target.lower(), sender_ip)
+                    if not is_valid_lan_ipv4(resolved_ip):
+                        resolved_ip = sender_ip
+                    model = ""
+                    for kv in txt_by_name.get(sl_name, []):
+                        if kv.lower().startswith("name="):
+                            model = kv.split("=", 1)[1].strip()
+                            break
+                    key = (resolved_ip, port, inst)
+                    found_map[key] = {
+                        "instance": inst,
+                        "service": svc_short,
+                        "ip": resolved_ip,
+                        "port": port,
+                        "model": model,
+                    }
+
+            # Si buscamos una instancia exacta (QR) y ya apareció, salir de inmediato
+            if instance_name and any(instance_name.lower() in v.get("instance", "").lower() for v in found_map.values()):
+                break
+            # Si consultamos IPs específicas y ya respondieron todas, salir sin esperar la 2da ráfaga
+            wanted_ips = {x for x in ips if x != u_local}
+            if wanted_ips and len(wanted_ips) <= 3 and wanted_ips.issubset({v["ip"] for v in found_map.values()}):
+                break
+
+        return list(found_map.values())
+    except Exception:
+        return []
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+def get_adb_connected_and_mdns(subnet=None, local_ip=None, target_ips=None):
     connected_map = {}
     mdns_ports = {}
     cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
@@ -1681,6 +2100,32 @@ def get_adb_connected_and_mdns():
             if len(parts) >= 3 and re.match(r"^\d+\.\d+\.\d+\.\d+:\d+$", parts[-1]):
                 ip, port = parts[-1].split(":", 1)
                 mdns_ports[ip] = (port, parts[0])
+    except Exception:
+        pass
+
+    # Respaldo RFC 6762 §6.7 (multicast + broadcast + unicast desde puerto efímero)
+    try:
+        u_local = local_ip or get_wifi_adapter_ip()
+        probe_ips = None
+        if target_ips:
+            probe_ips = list(target_ips)
+        elif subnet and subnet != "127.0.0":
+            # Primero 224.0.0.251 + .255 + IPs conocidas/ARP (~0.65s); si no halló nada, barrido unicast /24
+            known_sub = [k_ip for k_ip in load_known_devices().keys() if k_ip.startswith(subnet + ".")]
+            arp_sub = [a_ip for a_ip in get_local_arp_cache().keys() if a_ip.startswith(subnet + ".")]
+            probe_ips = list(set(known_sub + arp_sub))
+        if probe_ips is not None:
+            svcs = query_unicast_mdns_adb(probe_ips, "_adb-tls-connect._tcp.local",
+                                          local_ip=u_local, wait_s=0.60, bursts=2, use_multicast_broadcast=True)
+            if not svcs and subnet and subnet != "127.0.0" and not target_ips:
+                svcs = query_unicast_mdns_adb([f"{subnet}.{i}" for i in range(1, 255)],
+                                              "_adb-tls-connect._tcp.local",
+                                              local_ip=u_local, wait_s=0.55, bursts=1, use_multicast_broadcast=False)
+            for svc in svcs:
+                s_ip = svc["ip"]
+                if s_ip not in mdns_ports:
+                    label = svc.get("model") or svc.get("instance") or ""
+                    mdns_ports[s_ip] = (str(svc["port"]), label)
     except Exception:
         pass
 
@@ -1823,8 +2268,13 @@ def scan_live_wifi_devices(status_callback=None):
     # 1. Escaneo nativo SendARP masivo en paralelo sobre todos los 254 IPs
     live_arp_macs = fast_subnet_arp_scan(subnet)
 
-    # 2. Conexiones ADB vivas y servicios mDNS
-    connected_map, mdns_ports = get_adb_connected_and_mdns()
+    # 2. Conexiones ADB vivas y servicios mDNS (multicast + unicast RFC 6762 en toda la subred)
+    connected_map, mdns_ports = get_adb_connected_and_mdns(subnet=subnet, local_ip=local_ip)
+    # Incorporar MACs recién resueltas por el barrido unicast mDNS
+    try:
+        live_arp_macs.update(get_local_arp_cache())
+    except Exception:
+        pass
 
     # 3. Conjunto completo de candidatos:
     # - Todos los que respondieron físicamente a SendARP
@@ -1999,9 +2449,9 @@ def connect_ip_automatically(ip, known_port="", status_callback=None):
 
     open_ports = check_tcp_ports_fast(ip, ports_to_try, timeout=1.2)
     if not open_ports:
-        # Fallback a descubrimiento mDNS para Android 11+ (puerto dinámico TLS como Landi o teléfonos)
+        # Fallback a descubrimiento mDNS (multicast + unicast directo RFC 6762) para Android 11+
         try:
-            _, mdns_ports = get_adb_connected_and_mdns()
+            _, mdns_ports = get_adb_connected_and_mdns(target_ips=[ip])
             if ip in mdns_ports:
                 open_ports = [mdns_ports[ip][0]]
         except Exception:
@@ -2351,8 +2801,20 @@ class RealTimeMultiADBApp:
 
     def _on_closing(self):
         self._stop_watcher.set()
-        close_all_legacy_mic_players()
-        self.root.destroy()
+        _APP_SHUTTING_DOWN.set()
+        try:
+            self.root.withdraw()
+        except Exception:
+            pass
+        try:
+            close_all_legacy_mic_players()
+        except Exception:
+            pass
+        terminate_all_child_processes()
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
 
     def post_gui(self, fn, *args, **kwargs):
         self.msg_queue.put((fn, args, kwargs))
@@ -2509,8 +2971,15 @@ class RealTimeMultiADBApp:
                     if u.get("wlan_ip"):
                         usb_wlan_ips.add(u["wlan_ip"])
 
-                # 2. Conexiones ADB y puertos MDNS
-                connected_map, mdns_ports = get_adb_connected_and_mdns()
+                # 2. Conexiones ADB y puertos MDNS (incluye consulta unicast periódica para detectar puertos dinámicos nuevos)
+                should_probe_tcp = (now_curr - getattr(self, "_last_port_probe_time", 0) > 30.0)
+                if should_probe_tcp and self.subnet and self.subnet != "127.0.0":
+                    _known_quick = [k_ip for k_ip in load_known_devices().keys() if k_ip.startswith(self.subnet + ".")]
+                    _arp_quick = [a_ip for a_ip in get_local_arp_cache().keys() if a_ip.startswith(self.subnet + ".")]
+                    _u_targets = list(set(_known_quick + _arp_quick))
+                    connected_map, mdns_ports = get_adb_connected_and_mdns(local_ip=self.local_ip, target_ips=_u_targets)
+                else:
+                    connected_map, mdns_ports = get_adb_connected_and_mdns()
 
                 # 3. Lectura 100% pasiva de la tabla ARP local (Cero paquetes por el aire, cero saturación Wi-Fi)
                 arp_macs = get_local_arp_cache()
@@ -2539,7 +3008,6 @@ class RealTimeMultiADBApp:
 
                 # Sondear puertos TCP solo en equipos no conectados y con cadencia espaciada para no agotar sockets
                 candidate_port_results = {}
-                should_probe_tcp = (now_curr - getattr(self, "_last_port_probe_time", 0) > 30.0)
                 if should_probe_tcp:
                     self._last_port_probe_time = now_curr
                     def _probe_ports_safe(ip):
@@ -2895,12 +3363,12 @@ class RealTimeMultiADBApp:
             pantalla_widget = mb_pantalla
 
         # 3. Botón "📁 Archivos" (Explorador integrado ADB para transferir archivos sin bloqueos)
-        can_files = (is_adb or is_usb)
+        can_files = not is_sys and (is_on_net or is_adb or is_usb or dev.get("is_static"))
         btn_files = ttk.Button(
             ctrl_frame,
             text="📁 Archivos",
             width=10,
-            command=lambda d=dev: self.open_device_file_manager(d)
+            command=lambda k=dev_key, d=dev: self.open_device_file_manager(self._get_row_dev(k, d))
         )
         btn_files.pack(side=tk.LEFT, padx=2)
         btn_files.config(state=tk.NORMAL if can_files else tk.DISABLED)
@@ -3069,9 +3537,10 @@ class RealTimeMultiADBApp:
                     command=lambda d=dev: self.connect_single_device(d)
                 )
 
+        can_files = not is_sys and (is_on_net or is_adb or is_usb or dev.get("is_static"))
         btn_f = row_info.get("btn_files")
         if btn_f:
-            btn_f.config(state=tk.NORMAL if (is_adb or is_usb) else tk.DISABLED)
+            btn_f.config(state=tk.NORMAL if can_files else tk.DISABLED)
 
         can_screen = (is_adb or is_usb or (is_port_open and not is_sys and is_on_net))
         pantalla_w = row_info.get("pantalla_widget")
@@ -3299,15 +3768,80 @@ class RealTimeMultiADBApp:
 
     def open_device_file_manager(self, dev):
         """Abre el Explorador de Archivos ADB integrado con barra de progreso estilo Windows,
-        arrastrar y soltar (Drag and Drop), copiar/cortar/pegar y atajos de teclado."""
+        arrastrar y soltar (Drag and Drop), copiar/cortar/pegar y atajos de teclado.
+        Conecta por ADB automáticamente si el dispositivo no estaba conectado."""
+        dev = self._get_row_dev(dev.get("key"), dev) if dev else {}
         dev_name = dev.get("name", "Dispositivo")
         ip = dev.get("ip", "")
         serial = dev.get("serial", "")
-        target = resolve_active_adb_target(ip, dev=dev) or serial or ip
-        if not target:
-            messagebox.showwarning("No Conectado", f"{dev_name} no se encuentra conectado a ADB.")
+        dev_key = dev.get("key", ip)
+
+        serial_target = dev.get("serial")
+        if not serial_target:
+            if dev.get("port"):
+                serial_target = f"{dev['ip']}:{dev['port']}"
+            else:
+                serial_target = dev.get("ip", "")
+
+        resolved = resolve_active_adb_target(serial_target, dev=dev)
+        cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+        is_already_active = False
+        if dev.get("is_usb"):
+            chk_t = resolved or serial_target
+            try:
+                chk = subprocess.run(["adb", "-s", str(chk_t), "get-state"], capture_output=True, text=True, creationflags=cflags, timeout=1.5)
+                if "device" in chk.stdout:
+                    is_already_active = True
+            except Exception:
+                pass
+        else:
+            if resolved:
+                try:
+                    chk = subprocess.run(["adb", "-s", str(resolved), "get-state"], capture_output=True, text=True, creationflags=cflags, timeout=1.5)
+                    if "device" in chk.stdout:
+                        is_already_active = True
+                except Exception:
+                    pass
+
+        if not is_already_active and not dev.get("is_usb"):
+            self.set_status(f"Conectando ADB a {dev_name} ({ip}) para acceder a sus archivos...")
+            threading.Thread(target=self._auto_connect_and_open_files, args=(dev,), daemon=True).start()
             return
 
+        self._show_device_file_manager_window(dev, resolved or serial_target)
+
+    def _auto_connect_and_open_files(self, dev):
+        dev_key = dev.get("key", dev.get("ip", ""))
+        ip = dev.get("ip", "")
+        dev_name = dev.get("name", "Dispositivo")
+        row_info = self.device_rows.get(dev_key)
+        if row_info:
+            self.post_gui(lambda inf=row_info: inf["status_lbl"].config(text="⏳ Conectando...", foreground="#b36b00"))
+
+        ok, detail, model = connect_ip_automatically(ip, known_port=dev.get("port", ""), status_callback=self.set_status)
+        if ok:
+            ensure_storage_mount()
+            ensure_device_internet_stability(detail)
+            dev["is_adb_connected"] = True
+            dev["serial"] = detail
+            if model:
+                dev["name"] = model
+            resolved = resolve_active_adb_target(detail, dev=dev) or detail
+            self.post_gui(self._update_row_state_by_key, dev_key, dev)
+            self.set_status(f"¡Conectado exitosamente a {dev['name']}! Abriendo archivos...")
+            self.post_gui(self._show_device_file_manager_window, dev, resolved)
+        else:
+            open_now = check_tcp_ports_fast(ip, [5555, 7888])
+            dev["is_port_open"] = bool(open_now)
+            self.post_gui(self._update_row_state_by_key, dev_key, dev)
+            self.post_gui(messagebox.showwarning, "No se pudo acceder a archivos",
+                          f"No se pudo conectar a {dev_name} ({ip}) por ADB.\n\nDetalle: {detail}\n\nVerifique que el dispositivo esté encendido, conectado a la red y con depuración ADB activa.")
+
+    def _show_device_file_manager_window(self, dev, target):
+        dev_name = dev.get("name", "Dispositivo")
+        ip = dev.get("ip", "")
+        serial = dev.get("serial", "")
         mounted_drive = get_device_mounted_drive(dev_name, ip or serial)
 
         dialog = tk.Toplevel(self.root)
@@ -3317,6 +3851,55 @@ class RealTimeMultiADBApp:
         dialog.transient(self.root)
 
         cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        current_target = [target]
+
+        def ensure_connected_target(force_reconnect=False):
+            t = current_target[0]
+            if dev.get("is_usb"):
+                return t
+            if not force_reconnect:
+                try:
+                    chk = subprocess.run(["adb", "-s", str(t), "get-state"], capture_output=True, text=True, creationflags=cflags, timeout=1.5)
+                    if "device" in chk.stdout:
+                        return t
+                except Exception:
+                    pass
+            if ip:
+                ok, detail, model = connect_ip_automatically(ip, known_port=dev.get("port", ""))
+                if ok:
+                    dev["is_adb_connected"] = True
+                    dev["serial"] = detail
+                    new_t = resolve_active_adb_target(detail, dev=dev) or detail
+                    current_target[0] = new_t
+                    try:
+                        dialog.after(0, lambda: dialog.title(f"📁 Explorador de Archivos ADB - {dev_name} ({new_t})"))
+                    except Exception:
+                        pass
+                    return new_t
+            return t
+
+        def run_adb(cmd_args, timeout=8, max_retries=1):
+            """Ejecuta un comando ADB con reintento y reconexión automática si el dispositivo se desconecta."""
+            t = ensure_connected_target(force_reconnect=False)
+            full_cmd = ["adb", "-s", str(t)] + list(cmd_args)
+            try:
+                res = subprocess.run(full_cmd, capture_output=True, text=True, errors="replace",
+                                     creationflags=cflags, timeout=timeout)
+            except Exception as ex:
+                res = subprocess.CompletedProcess(full_cmd, 1, stdout="", stderr=str(ex))
+
+            raw_err = (res.stderr or "").lower()
+            raw_out = (res.stdout or "").lower()
+            is_offline = any(k in raw_err or k in raw_out for k in ("not found", "offline", "error: closed", "device '", "cannot connect"))
+            if is_offline and max_retries > 0 and not dev.get("is_usb") and ip:
+                new_t = ensure_connected_target(force_reconnect=True)
+                full_cmd = ["adb", "-s", str(new_t)] + list(cmd_args)
+                try:
+                    res = subprocess.run(full_cmd, capture_output=True, text=True, errors="replace",
+                                         creationflags=cflags, timeout=timeout)
+                except Exception as ex:
+                    res = subprocess.CompletedProcess(full_cmd, 1, stdout="", stderr=str(ex))
+            return res
 
         # Clipboard interno para transferencias dentro del dispositivo Android
         # {"action": "copy"|"cut", "source_dir": str, "items": list}
@@ -3482,11 +4065,12 @@ class RealTimeMultiADBApp:
                         lbl_file.config(text=f"Elemento {i} de {total_items}: {n}")
                     pwin.after(0, _update_file_label)
 
+                    active_t = ensure_connected_target(force_reconnect=False)
                     if is_upload:
-                        cmd = ["adb", "-s", str(target), "push", src_path, dest_dir]
+                        cmd = ["adb", "-s", str(active_t), "push", src_path, dest_dir]
                         remote_dest_file = dest_dir.rstrip("/") + "/" + dest_name
                     else:
-                        cmd = ["adb", "-s", str(target), "pull", src_path, dest_dir]
+                        cmd = ["adb", "-s", str(active_t), "pull", src_path, dest_dir]
                         local_dest_file = os.path.join(dest_dir, dest_name)
 
                     try:
@@ -3503,7 +4087,7 @@ class RealTimeMultiADBApp:
                             current_item_done = 0
                             if is_upload:
                                 try:
-                                    s_res = subprocess.run(["adb", "-s", str(target), "shell", f'stat -c %s "{remote_dest_file}"'],
+                                    s_res = subprocess.run(["adb", "-s", str(current_target[0]), "shell", f'stat -c %s "{remote_dest_file}"'],
                                                            capture_output=True, text=True, creationflags=cflags, timeout=1.2)
                                     s_out = s_res.stdout.strip()
                                     if s_out.isdigit():
@@ -3633,8 +4217,7 @@ class RealTimeMultiADBApp:
                 items = []
                 err_msg = ""
                 try:
-                    res = subprocess.run(["adb", "-s", str(target), "shell", f'ls -la "{norm_path}"'],
-                                         capture_output=True, text=True, errors="replace", creationflags=cflags, timeout=8)
+                    res = run_adb(["shell", f'ls -la "{norm_path}"'], timeout=10)
                     for line in res.stdout.splitlines():
                         parsed = parse_android_ls_line(line)
                         if not parsed:
@@ -3652,13 +4235,13 @@ class RealTimeMultiADBApp:
                     # Resolver symlinks (ej. /sdcard -> /storage/self/primary) para permitir navegarlos como carpetas
                     link_items = [it for it in items if it.get("is_link")]
                     if link_items:
+                        norm_prefix = "/" if norm_path == "/" else (norm_path.rstrip("/") + "/")
                         checks = " ; ".join(
-                            f'[ -d "{norm_path}{it["name"].replace(chr(34), "")}" ] && echo "{it["name"].replace(chr(34), "")}"'
+                            f'[ -d "{norm_prefix}{it["name"].replace(chr(34), "")}" ] && echo "{it["name"].replace(chr(34), "")}"'
                             for it in link_items
                         )
                         try:
-                            chk_res = subprocess.run(["adb", "-s", str(target), "shell", checks],
-                                                     capture_output=True, text=True, errors="replace", creationflags=cflags, timeout=4)
+                            chk_res = run_adb(["shell", checks], timeout=5)
                             dir_links = {ln.strip() for ln in chk_res.stdout.splitlines() if ln.strip()}
                             for it in link_items:
                                 if it["name"] in dir_links:
@@ -3670,6 +4253,13 @@ class RealTimeMultiADBApp:
                         raw_err = (res.stderr or res.stdout or "").strip()
                         if raw_err:
                             err_msg = raw_err.splitlines()[-1]
+                        # Fallbacks inteligentes si la ruta inicial no existe en este dispositivo
+                        if norm_path == "/sdcard/":
+                            dialog.after(0, lambda: load_directory("/storage/emulated/0/"))
+                            return
+                        elif norm_path == "/storage/emulated/0/":
+                            dialog.after(0, lambda: load_directory("/"))
+                            return
                     items.sort(key=lambda x: (0 if x["is_dir"] else 1, x["name"].lower()))
                 except Exception as ex:
                     err_msg = str(ex)
@@ -3703,14 +4293,19 @@ class RealTimeMultiADBApp:
         ttk.Button(nav_frame, text="Ir", width=4, command=go_to_entered).pack(side=tk.LEFT, padx=(0, 8))
 
         def go_up():
-            curr = path_var.get().rstrip("/")
+            curr = path_var.get().strip().rstrip("/")
+            if not curr or curr == "/":
+                return
             if "/" in curr:
                 parent = curr.rsplit("/", 1)[0]
                 if not parent:
                     parent = "/"
                 load_directory(parent)
+            else:
+                load_directory("/")
 
         ttk.Button(nav_frame, text="⬆ Arriba", command=go_up).pack(side=tk.LEFT, padx=2)
+        ttk.Button(nav_frame, text="📂 Raíz (/)", command=lambda: load_directory("/")).pack(side=tk.LEFT, padx=2)
         ttk.Button(nav_frame, text="🏠 Almacenamiento", command=lambda: load_directory("/sdcard/")).pack(side=tk.LEFT, padx=2)
         ttk.Button(nav_frame, text="📥 Descargas", command=lambda: load_directory("/sdcard/Download/")).pack(side=tk.LEFT, padx=2)
         ttk.Button(nav_frame, text="📷 Fotos", command=lambda: load_directory("/sdcard/DCIM/")).pack(side=tk.LEFT, padx=2)
@@ -3895,11 +4490,9 @@ class RealTimeMultiADBApp:
                     src_full = f"{src_dir}/{it_name}"
                     dest_full = f"{dest_dir}/{it_name}"
                     if action == "copy":
-                        subprocess.run(["adb", "-s", str(target), "shell", f'cp -r "{src_full}" "{dest_full}"'],
-                                       capture_output=True, text=True, creationflags=cflags, timeout=30)
+                        run_adb(["shell", f'cp -r "{src_full}" "{dest_full}"'], timeout=30)
                     elif action == "cut":
-                        subprocess.run(["adb", "-s", str(target), "shell", f'mv "{src_full}" "{dest_full}"'],
-                                       capture_output=True, text=True, creationflags=cflags, timeout=10)
+                        run_adb(["shell", f'mv "{src_full}" "{dest_full}"'], timeout=10)
 
                 if action == "cut":
                     device_clipboard["items"] = []
@@ -3925,8 +4518,7 @@ class RealTimeMultiADBApp:
             dest_full = f"{curr_dir}/{clean_name}"
 
             try:
-                subprocess.run(["adb", "-s", str(target), "shell", f'mv "{src_full}" "{dest_full}"'],
-                               capture_output=True, text=True, creationflags=cflags, timeout=5)
+                run_adb(["shell", f'mv "{src_full}" "{dest_full}"'], timeout=5)
                 load_directory(path_var.get())
             except Exception as ex:
                 messagebox.showerror("Error", f"No se pudo renombrar: {ex}", parent=dialog)
@@ -3940,8 +4532,7 @@ class RealTimeMultiADBApp:
             new_full = f"{curr_dir}/{clean_name}"
             status_lbl.config(text=f"Creando carpeta {clean_name}...")
             try:
-                subprocess.run(["adb", "-s", str(target), "shell", f'mkdir -p "{new_full}"'],
-                               capture_output=True, text=True, creationflags=cflags, timeout=5)
+                run_adb(["shell", f'mkdir -p "{new_full}"'], timeout=5)
                 load_directory(path_var.get())
             except Exception as ex:
                 messagebox.showerror("Error", f"No se pudo crear la carpeta: {ex}", parent=dialog)
@@ -3962,8 +4553,7 @@ class RealTimeMultiADBApp:
                 for it_name in names:
                     full_p = f"{curr_dir}/{it_name}"
                     try:
-                        subprocess.run(["adb", "-s", str(target), "shell", f'rm -rf "{full_p}"'],
-                                       capture_output=True, text=True, creationflags=cflags, timeout=8)
+                        run_adb(["shell", f'rm -rf "{full_p}"'], timeout=8)
                     except Exception:
                         pass
                 dialog.after(0, lambda: load_directory(curr_dir))
@@ -4049,7 +4639,7 @@ class RealTimeMultiADBApp:
 
         name = dev.get("name", "Dispositivo")
         ip = dev.get("ip", "")
-        pc_ip = getattr(self, "local_ip", None) or get_local_ip()
+        pc_ip = getattr(self, "local_ip", None) or get_wifi_adapter_ip()
         current_port = str(dev.get("port") or dev.get("last_port") or "")
         if current_port in ("5555", "None"):
             current_port = ""
@@ -4171,14 +4761,6 @@ class RealTimeMultiADBApp:
         ttk.Label(grid_f, text="Puerto de vinculación:", font=("Segoe UI", 8)).grid(row=row_idx, column=0, sticky=tk.W, pady=3)
         pair_port_entry = ttk.Entry(grid_f, width=14, font=("Consolas", 9))
         pair_port_entry.grid(row=row_idx, column=1, sticky=tk.W, padx=6, pady=3)
-        # Autocompletar puerto si ya está expuesto en la red
-        try:
-            t_ip = ip or (ip_manual_entry.get().strip() if ip_manual_entry else "192.168.1.5")
-            found_p = check_tcp_ports_fast(t_ip, [45765, 37123, 41187, 39541, 43211, 38125], timeout=0.15)
-            if found_p:
-                pair_port_entry.insert(0, str(found_p[0]))
-        except Exception:
-            pass
         row_idx += 1
 
         ttk.Label(grid_f, text="Código (6 dígitos):", font=("Segoe UI", 8)).grid(row=row_idx, column=0, sticky=tk.W, pady=3)
@@ -4207,8 +4789,8 @@ class RealTimeMultiADBApp:
             if not p_code or len(p_code) < 6:
                 messagebox.showerror("Error", "Ingresa el código de 6 dígitos que muestra el dispositivo.", parent=dialog)
                 return
-            if not c_port.isdigit() or not (1 <= int(c_port) <= 65535):
-                messagebox.showerror("Error", "Ingresa el puerto de conexión (el que se muestra en 'Dirección IP y puerto' en la pantalla principal).", parent=dialog)
+            if c_port and (not c_port.isdigit() or not (1 <= int(c_port) <= 65535)):
+                messagebox.showerror("Error", "El puerto de conexión debe ser un número válido (1 - 65535) o dejarse vacío para detectarlo automáticamente.", parent=dialog)
                 return
 
             on_dialog_close()
@@ -4251,9 +4833,49 @@ class RealTimeMultiADBApp:
         def _qr_worker(srv_name, pwd):
             cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
             target_ip = dev.get("ip", "") if dev else ""
-            subnet_prefix = ".".join(pc_ip.split(".")[:3]) + "." if pc_ip else "192.168.1."
-            already_paired = [False]
 
+            def _set_status(text, color):
+                self.post_gui(lambda t=text, c=color: qr_status_lbl.config(text=t, foreground=c))
+
+            def _close_zc(zc_inst):
+                if zc_inst:
+                    try:
+                        zc_inst.close()
+                    except Exception:
+                        pass
+                if current_zeroconf[0] is zc_inst:
+                    current_zeroconf[0] = None
+
+            # --- Descubrimiento mDNS con el propio ADB (mismo método que Android Studio) ---
+            mdns_re = re.compile(r"^(\S+)\s+(_adb-tls-(?:pairing|connect)\._tcp)\.?\s+(\d{1,3}(?:\.\d{1,3}){3}):(\d+)")
+
+            def _adb_mdns_services():
+                """Devuelve lista de (instancia, tipo, ip, puerto) desde 'adb mdns services'."""
+                found = []
+                try:
+                    res = subprocess.run(["adb", "mdns", "services"], capture_output=True, text=True,
+                                         errors="replace", creationflags=cflags, timeout=4)
+                    for line in (res.stdout or "").splitlines():
+                        m = mdns_re.match(line.strip())
+                        if m:
+                            found.append((m.group(1), m.group(2), m.group(3), int(m.group(4))))
+                except Exception:
+                    pass
+                return found
+
+            def _run_pair(ip_addr, port):
+                """Ejecuta adb pair. Solo se considera éxito si adb responde 'Successfully paired'."""
+                try:
+                    res = subprocess.run(["adb", "pair", f"{ip_addr}:{port}", pwd], capture_output=True,
+                                         text=True, errors="replace", creationflags=cflags, timeout=12)
+                    out = (res.stdout + res.stderr).strip()
+                except subprocess.TimeoutExpired:
+                    return False, "Tiempo de espera agotado en adb pair"
+                except Exception as e:
+                    return False, str(e)
+                return ("successfully paired" in out.lower()), out
+
+            # --- Escucha mDNS con zeroconf (respaldo del anterior) ---
             class PairingListener:
                 def __init__(self):
                     self.ip = None
@@ -4261,19 +4883,15 @@ class RealTimeMultiADBApp:
 
                 def _resolve(self, zc, type_, name):
                     try:
+                        # El teléfono publica el servicio de vinculación con el nombre exacto del QR
+                        if srv_name.lower() not in name.lower():
+                            return
                         info = zc.get_service_info(type_, name, timeout=2500)
                         if info:
-                            addresses = info.parsed_addresses()
-                            if addresses:
-                                ip_found = addresses[0]
-                                is_match = (
-                                    srv_name.lower() in name.lower()
-                                    or (target_ip and ip_found == target_ip)
-                                    or ip_found.startswith(subnet_prefix)
-                                )
-                                if is_match and not self.ip:
-                                    self.ip = ip_found
-                                    self.port = info.port
+                            addresses = [a for a in info.parsed_addresses() if "." in a]
+                            if addresses and not self.ip:
+                                self.ip = addresses[0]
+                                self.port = info.port
                     except Exception:
                         pass
 
@@ -4287,9 +4905,12 @@ class RealTimeMultiADBApp:
                     pass
 
             try:
-                zc = Zeroconf()
+                zc = Zeroconf(interfaces=[pc_ip]) if (pc_ip and is_valid_lan_ipv4(pc_ip)) else Zeroconf()
             except Exception:
-                zc = None
+                try:
+                    zc = Zeroconf()
+                except Exception:
+                    zc = None
 
             current_zeroconf[0] = zc
             listener = PairingListener()
@@ -4299,130 +4920,117 @@ class RealTimeMultiADBApp:
                 except Exception:
                     pass
 
-            # Lista de IPs candidatas de la red por si el router bloquea mDNS
-            candidate_ips = []
-            if target_ip:
-                candidate_ips.append(target_ip)
-            for prio_ip in ["192.168.1.5", "192.168.1.78", "192.168.1.77"]:
-                if prio_ip not in candidate_ips and prio_ip != pc_ip:
-                    candidate_ips.append(prio_ip)
-            for r_k, r_info in list(self.device_rows.items()):
-                r_dev = r_info.get("dev", {})
-                r_ip = r_dev.get("ip", "")
-                if r_ip and r_ip != pc_ip and not r_dev.get("is_router") and not r_dev.get("is_local_or_router"):
-                    if r_ip not in candidate_ips:
-                        candidate_ips.append(r_ip)
+            # Estado compartido de la vinculación (un solo 'adb pair' a la vez)
+            pair_state = {"ip": None, "port": None, "paired": False, "last_error": ""}
+            pair_lock = threading.Lock()
 
-            def _scan_ephemeral_ports(ip_addr, port_range=range(30000, 52000), timeout_s=0.03):
-                open_ports = []
-                def _chk(p):
-                    if stop_qr_event.is_set() or listener.ip:
-                        return None
-                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    s.settimeout(timeout_s)
-                    try:
-                        if s.connect_ex((ip_addr, p)) == 0:
-                            return p
-                    except Exception:
-                        pass
-                    finally:
-                        try:
-                            s.close()
-                        except Exception:
-                            pass
-                    return None
+            def _try_pair(ip_addr, port):
+                with pair_lock:
+                    if pair_state["paired"] or stop_qr_event.is_set():
+                        return pair_state["paired"]
+                    _set_status(f"🔄 ¡Detectado ({ip_addr}:{port})! Vinculando...", "#b36b00")
+                    ok, out = _run_pair(ip_addr, port)
+                    if ok:
+                        pair_state.update(ip=ip_addr, port=port, paired=True)
+                    else:
+                        pair_state["last_error"] = out
+                        _set_status("⏳ Esperando escaneo con la cámara del teléfono...", "#0066cc")
+                    return ok
 
-                with concurrent.futures.ThreadPoolExecutor(max_workers=600) as ex:
-                    for res_p in ex.map(_chk, port_range):
-                        if res_p:
-                            open_ports.append(res_p)
-                return open_ports
+            # Construir lista de IPs prioritarias y subred /24 completa para consulta unicast mDNS (RFC 6762 §6.7)
+            subnet_prefix = ""
+            if pc_ip and is_valid_lan_ipv4(pc_ip):
+                subnet_prefix = ".".join(str(pc_ip).split(".")[:3])
+            full_subnet_ips = [f"{subnet_prefix}.{i}" for i in range(1, 255) if f"{subnet_prefix}.{i}" != pc_ip] if subnet_prefix else []
 
-            failed_pair_ports = set()
+            def _collect_priority_ips():
+                ips_list = []
+                def _add(x):
+                    if x and x != pc_ip and is_valid_lan_ipv4(x) and x not in ips_list:
+                        ips_list.append(x)
+                _add(target_ip)
+                for _rk, r_info in list(self.device_rows.items()):
+                    r_dev = r_info.get("dev", {})
+                    if not r_dev.get("is_router") and not r_dev.get("is_local_or_router"):
+                        _add(r_dev.get("ip", ""))
+                for a_ip in get_local_arp_cache().keys():
+                    if not subnet_prefix or a_ip.startswith(subnet_prefix + "."):
+                        _add(a_ip)
+                for k_ip in load_known_devices().keys():
+                    if not subnet_prefix or k_ip.startswith(subnet_prefix + "."):
+                        _add(k_ip)
+                return ips_list
+
+            # Bucle principal: combina mDNS multicast (ADB + Zeroconf) + mDNS Unicast RFC 6762 §6.7
+            # (El modo unicast funciona incluso cuando el router Wi-Fi bloquea multicast 224.0.0.251)
             start_t = time.time()
+            pair_attempts = {}  # (ip, port) -> [count, last_ts]
+            cycle = 0
+            while not stop_qr_event.is_set() and not pair_state["paired"] and (time.time() - start_t) < 90:
+                endpoints = []
+                # 1. mDNS nativo de ADB (multicast)
+                for inst, svc, s_ip, s_port in _adb_mdns_services():
+                    if svc.startswith("_adb-tls-pairing") and srv_name.lower() in inst.lower():
+                        endpoints.append((s_ip, s_port))
+                # 2. Zeroconf multicast en la interfaz Wi-Fi
+                if listener.ip and listener.port:
+                    endpoints.append((listener.ip, listener.port))
+                # 3. Consulta mDNS con QU=1 (RFC 6762 §5.4 + §6.7): consulta multicast/broadcast + IPs prioritarias
+                #    y cada 4 ciclos toda la subred /24; incluye consulta SRV directa por srv_name (delayMs=0 en Android 14-16)
+                if not endpoints:
+                    u_ips = full_subnet_ips if (full_subnet_ips and cycle % 4 == 3) else (_collect_priority_ips() or full_subnet_ips)
+                    u_svcs = query_unicast_mdns_adb(
+                        u_ips,
+                        service_type="_adb-tls-pairing._tcp.local",
+                        local_ip=pc_ip,
+                        wait_s=0.60 if len(u_ips) <= 30 else 0.70,
+                        bursts=1,
+                        stop_event=stop_qr_event,
+                        use_multicast_broadcast=True,
+                        instance_name=srv_name,
+                    )
+                    matched_eps = []
+                    other_pairing_eps = []
+                    for s_info in u_svcs:
+                        cand_ep = (s_info["ip"], int(s_info["port"]))
+                        if srv_name.lower() in s_info.get("instance", "").lower():
+                            if cand_ep not in matched_eps:
+                                matched_eps.append(cand_ep)
+                        else:
+                            if cand_ep not in other_pairing_eps:
+                                other_pairing_eps.append(cand_ep)
+                    endpoints.extend(matched_eps or other_pairing_eps)
+                cycle += 1
 
-            while not stop_qr_event.is_set() and listener.ip is None and (time.time() - start_t) < 90:
-                # Sondeo activo ultrarrápido de puertos dinámicos (30000-52000) para garantizar detección sin depender de mDNS
-                for c_ip in candidate_ips:
-                    if stop_qr_event.is_set() or listener.ip:
+                now_ts = time.time()
+                for ep in endpoints:
+                    if pair_state["paired"] or stop_qr_event.is_set():
                         break
-                    # Verificar primero si la IP responde o está activa
-                    open_p_list = _scan_ephemeral_ports(c_ip, range(30000, 52000), timeout_s=0.025)
-                    for p_cand in open_p_list:
-                        if stop_qr_event.is_set() or listener.ip:
-                            break
-                        if (c_ip, p_cand) in failed_pair_ports:
-                            continue
-                        try:
-                            self.post_gui(lambda ip_=c_ip, pt_=p_cand: qr_status_lbl.config(
-                                text=f"🔄 Puerto detectado ({ip_}:{pt_})! Vinculando...",
-                                foreground="#b36b00"
-                            ))
-                            pair_try = subprocess.run(
-                                ["adb", "pair", f"{c_ip}:{p_cand}", pwd],
-                                capture_output=True, text=True, creationflags=cflags, timeout=30
-                            )
-                            out_str = (pair_try.stdout + pair_try.stderr).lower()
-                            if "successfully paired" in out_str or pair_try.returncode == 0:
-                                listener.ip = c_ip
-                                listener.port = p_cand
-                                already_paired[0] = True
-                                break
-                            else:
-                                failed_pair_ports.add((c_ip, p_cand))
-                        except Exception:
-                            failed_pair_ports.add((c_ip, p_cand))
-                if not listener.ip:
-                    time.sleep(0.2)
+                    cnt, last_att = pair_attempts.get(ep, (0, 0.0))
+                    if cnt >= 3 or (now_ts - last_att) < 1.5:
+                        continue
+                    pair_attempts[ep] = (cnt + 1, now_ts)
+                    _try_pair(ep[0], ep[1])
+
+                if not pair_state["paired"]:
+                    stop_qr_event.wait(0.35)
 
             if stop_qr_event.is_set():
-                if zc:
-                    try:
-                        zc.close()
-                    except Exception:
-                        pass
+                _close_zc(zc)
                 return
 
-            if not listener.ip or not listener.port:
-                self.post_gui(lambda: qr_status_lbl.config(
-                    text="⚠ Tiempo agotado. Pulsa 'Generar nuevo QR' o usa la Opción B de la derecha.",
-                    foreground="#cc3300"
-                ))
-                if zc:
-                    try:
-                        zc.close()
-                    except Exception:
-                        pass
+            if not pair_state["paired"]:
+                _close_zc(zc)
+                if pair_state["last_error"]:
+                    _set_status(f"❌ Error al vincular: {pair_state['last_error']}\nPulsa 'Generar nuevo QR' o usa la Opción B.", "#cc0000")
+                else:
+                    _set_status("⚠ Tiempo agotado. Pulsa 'Generar nuevo QR' o usa la Opción B de la derecha.", "#cc3300")
                 return
 
-            pair_ip = listener.ip
-            pair_port = listener.port
+            pair_ip = pair_state["ip"]
+            pair_port = pair_state["port"]
 
-            if not already_paired[0]:
-                self.post_gui(lambda: qr_status_lbl.config(
-                    text=f"🔄 ¡Detectado ({pair_ip}:{pair_port})! Vinculando de inmediato...",
-                    foreground="#b36b00"
-                ))
-                pair_ep = f"{pair_ip}:{pair_port}"
-                res = subprocess.run(["adb", "pair", pair_ep, pwd], capture_output=True, text=True, creationflags=cflags, timeout=10)
-                pair_out = (res.stdout + res.stderr).strip()
-
-                if "successfully paired" not in pair_out.lower() and res.returncode != 0:
-                    self.post_gui(lambda: qr_status_lbl.config(
-                        text=f"❌ Error al vincular: {pair_out}",
-                        foreground="#cc0000"
-                    ))
-                    if zc:
-                        try:
-                            zc.close()
-                        except Exception:
-                            pass
-                    return
-
-            self.post_gui(lambda: qr_status_lbl.config(
-                text="✔ ¡Vinculado con éxito! Buscando puerto de conexión...",
-                foreground="#196f3d"
-            ))
+            _set_status("✔ ¡Vinculado con éxito! Buscando puerto de conexión...", "#196f3d")
 
             class ConnectListener:
                 def __init__(self, t_ip):
@@ -4434,7 +5042,7 @@ class RealTimeMultiADBApp:
                         info = zc_inst.get_service_info(type_, name, timeout=2000)
                         if info:
                             addresses = info.parsed_addresses()
-                            if addresses and addresses[0] == self.target_ip:
+                            if self.target_ip in addresses:
                                 self.port = info.port
                     except Exception:
                         pass
@@ -4455,83 +5063,129 @@ class RealTimeMultiADBApp:
                 except Exception:
                     pass
 
-            # Esperar brevemente mDNS o escanear activamente el puerto de conexión en pair_ip
+            def _adb_connect_verified_qr(port):
+                ep = f"{pair_ip}:{port}"
+                is_on, out, is_unauth = connect_adb_endpoint_verified(ep, cflags=cflags, attempts=2)
+                if is_on:
+                    return True, out
+                if is_unauth:
+                    return False, out
+                return False, out
+
+            # Buscar el puerto de conexión: Unicast mDNS directo al teléfono (instantáneo) + ADB mDNS + Zeroconf
             c_start = time.time()
             connect_port = None
-            while not stop_qr_event.is_set() and not connect_port and (time.time() - c_start) < 12:
-                if c_listener.port:
-                    connect_port = c_listener.port
-                    break
-                open_conn_ports = _scan_ephemeral_ports(pair_ip, range(30000, 52000), timeout_s=0.025)
-                for cp in open_conn_ports:
-                    if cp != pair_port:
+            detected_model = ""
+            conn_out = ""
+            tried_conn_counts = {}
+            while not stop_qr_event.is_set() and not connect_port and (time.time() - c_start) < 25:
+                cands = []
+                # 1. Consulta Unicast mDNS directa al teléfono vinculado (~200ms incluso si router bloquea multicast)
+                for s_info in query_unicast_mdns_adb([pair_ip], "_adb-tls-connect._tcp.local",
+                                                     local_ip=pc_ip, wait_s=0.75, bursts=2, stop_event=stop_qr_event):
+                    if s_info["ip"] == pair_ip:
+                        p_int = int(s_info["port"])
+                        if p_int != pair_port and p_int not in cands:
+                            cands.append(p_int)
+                        if s_info.get("model") and not detected_model:
+                            detected_model = s_info["model"]
+                # 2. ADB mDNS y Zeroconf multicast
+                for inst, svc, s_ip, s_port in _adb_mdns_services():
+                    if svc.startswith("_adb-tls-connect") and s_ip == pair_ip and s_port not in cands:
+                        cands.append(s_port)
+                if c_listener.port and c_listener.port not in cands:
+                    cands.append(c_listener.port)
+
+                for cp in cands:
+                    if stop_qr_event.is_set():
+                        break
+                    if tried_conn_counts.get(cp, 0) >= 3:
+                        continue
+                    tried_conn_counts[cp] = tried_conn_counts.get(cp, 0) + 1
+                    _set_status(f"🚀 Conectando ADB a {pair_ip}:{cp}...", "#196f3d")
+                    ok, conn_out = _adb_connect_verified_qr(cp)
+                    if ok:
                         connect_port = cp
                         break
                 if not connect_port:
-                    time.sleep(0.3)
+                    stop_qr_event.wait(0.8)
 
-            if zc:
+            _close_zc(zc)
+
+            if stop_qr_event.is_set():
+                return
+
+            # Últimos recursos: puerto guardado del equipo o puertos clásicos
+            if not connect_port:
+                fallback_ports = []
+                if dev and dev.get("port"):
+                    fallback_ports.append(str(dev["port"]))
+                fallback_ports.extend(check_tcp_ports_fast(pair_ip, [5555, 7888], timeout=1.0))
+                for fp in fallback_ports:
+                    try:
+                        fp_int = int(fp)
+                    except Exception:
+                        continue
+                    if tried_conn_counts.get(fp_int, 0) >= 2:
+                        continue
+                    tried_conn_counts[fp_int] = tried_conn_counts.get(fp_int, 0) + 1
+                    ok, conn_out = _adb_connect_verified_qr(fp_int)
+                    if ok:
+                        connect_port = fp_int
+                        break
+
+            if not connect_port:
+                if conn_out:
+                    _set_status(f"Vinculado con éxito. Error conectando: {conn_out}\nIngresa el puerto en 'Conectar por Puerto' para finalizar.", "#cc3300")
+                else:
+                    _set_status("✔ ¡Dispositivo vinculado con éxito!\nIngresa el puerto en 'Conectar por Puerto' para finalizar.", "#196f3d")
+                return
+
+            _set_status(f"🎉 ¡Dispositivo vinculado y conectado exitosamente en {pair_ip}:{connect_port}!", "#196f3d")
+
+            # Obtener el modelo real del dispositivo recién conectado si aún no lo tenemos
+            if not detected_model:
                 try:
-                    zc.close()
+                    m_res = subprocess.run(["adb", "-s", f"{pair_ip}:{connect_port}", "shell", "getprop", "ro.product.model"],
+                                           capture_output=True, text=True, errors="replace", creationflags=cflags, timeout=3)
+                    detected_model = (m_res.stdout or "").strip()
                 except Exception:
                     pass
 
-            if not connect_port and dev and dev.get("port"):
-                connect_port = int(dev["port"])
-
-            if not connect_port:
-                open_check = check_tcp_ports_fast(pair_ip, [5555, 7888], timeout=1.0)
-                if open_check:
-                    connect_port = int(open_check[0])
-
-            if not connect_port:
-                self.post_gui(lambda: qr_status_lbl.config(
-                    text="✔ ¡Dispositivo vinculado con éxito!\nIngresa el puerto en 'Conectar por Puerto' para finalizar.",
-                    foreground="#196f3d"
-                ))
-                return
-
-            self.post_gui(lambda: qr_status_lbl.config(
-                text=f"🚀 Conectando ADB a {pair_ip}:{connect_port}...",
-                foreground="#196f3d"
-            ))
-
-            conn_res = subprocess.run(["adb", "connect", f"{pair_ip}:{connect_port}"], capture_output=True, text=True, errors="replace", creationflags=cflags, timeout=8)
-            conn_out = (conn_res.stdout + conn_res.stderr).strip()
-
-            if "connected to" in conn_out.lower():
-                self.post_gui(lambda: qr_status_lbl.config(
-                    text=f"🎉 ¡Dispositivo vinculado y conectado exitosamente en {pair_ip}:{connect_port}!",
-                    foreground="#196f3d"
-                ))
-                dev_name = dev.get("name") if dev and dev.get("name") and "dispositivo" not in dev.get("name", "").lower() else f"Android ({pair_ip})"
-                save_known_device(
-                    pair_ip,
-                    name=dev_name,
-                    is_static=True,
-                    last_port=str(connect_port),
-                    network=self.current_net_name
-                )
-                if dev:
-                    dev["port"] = str(connect_port)
-                    dev["last_port"] = str(connect_port)
-                    dev["is_port_open"] = True
-                    dev["is_adb_connected"] = True
-                    self.post_gui(self._update_row_state_by_key, dev.get("key", pair_ip), dev)
-
-                def _auto_close():
-                    try:
-                        dialog.destroy()
-                    except Exception:
-                        pass
-                    self.trigger_scan()
-
-                self.root.after(1200, _auto_close)
+            existing_name = dev.get("name", "") if dev else ""
+            if detected_model:
+                dev_name = detected_model
+            elif existing_name and "dispositivo" not in existing_name.lower():
+                dev_name = existing_name
             else:
-                self.post_gui(lambda: qr_status_lbl.config(
-                    text=f"Vinculado con éxito. Error conectando: {conn_out}",
-                    foreground="#cc3300"
-                ))
+                dev_name = f"Android ({pair_ip})"
+
+            pair_mac = get_local_arp_cache().get(pair_ip, "") or (dev.get("mac", "") if dev else "")
+            save_known_device(
+                pair_ip,
+                name=dev_name,
+                mac=pair_mac,
+                is_static=True,
+                last_port=str(connect_port),
+                network=self.current_net_name
+            )
+            if dev and dev.get("key"):
+                dev["name"] = dev_name
+                dev["port"] = str(connect_port)
+                dev["last_port"] = str(connect_port)
+                dev["serial"] = f"{pair_ip}:{connect_port}"
+                dev["is_port_open"] = True
+                dev["is_adb_connected"] = True
+                self.post_gui(self._update_row_state_by_key, dev.get("key", pair_ip), dev)
+
+            def _auto_close():
+                try:
+                    dialog.destroy()
+                except Exception:
+                    pass
+                self.trigger_scan()
+
+            self.post_gui(lambda: self.root.after(1200, _auto_close))
 
         # Iniciar sesión QR automáticamente al abrir el diálogo
         start_qr_session()
@@ -4589,8 +5243,26 @@ class RealTimeMultiADBApp:
             pair_out = (res.stdout + res.stderr).strip()
 
             if "successfully paired" in pair_out.lower() or res.returncode == 0:
-                self.set_status(f"¡Vinculado con éxito a {name}! Conectando...")
-                self._apply_custom_port(dev, connect_port)
+                self.set_status(f"¡Vinculado con éxito a {name}! Buscando puerto de conexión...")
+                final_c_port = str(connect_port or "").strip()
+                if not final_c_port:
+                    for _ in range(4):
+                        u_svcs = query_unicast_mdns_adb([ip], "_adb-tls-connect._tcp.local",
+                                                        local_ip=getattr(self, "local_ip", ""), wait_s=0.75, bursts=2)
+                        for s_info in u_svcs:
+                            if s_info["ip"] == ip and str(s_info["port"]) != str(pair_port):
+                                final_c_port = str(s_info["port"])
+                                if s_info.get("model") and (not dev.get("name") or "dispositivo" in dev.get("name", "").lower()):
+                                    dev["name"] = s_info["model"]
+                                break
+                        if final_c_port:
+                            break
+                        time.sleep(0.5)
+                if final_c_port:
+                    self._apply_custom_port(dev, final_c_port)
+                else:
+                    self.set_status(f"¡Vinculado a {name}! Usa 'Conectar por Puerto' si no se detectó automáticamente.")
+                    self.post_gui(self.trigger_scan)
             else:
                 self.set_status(f"Fallo de vinculación: {pair_out}")
                 self.post_gui(
@@ -5368,4 +6040,7 @@ if __name__ == "__main__":
         app = RealTimeMultiADBApp(root)
         root.mainloop()
     finally:
+        terminate_all_child_processes()
         release_single_instance_lock()
+        # Salida total: no deja hilos ni procesos internos vivos hasta volver a abrir el programa
+        os._exit(0)
