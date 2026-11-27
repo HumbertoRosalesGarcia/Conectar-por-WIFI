@@ -2600,12 +2600,19 @@ class RealTimeMultiADBApp:
             command=self.hide_to_background
         ).pack(side=tk.RIGHT, padx=5)
 
+        # El escaneo manual sigue disponible internamente (trigger_scan) pero el botón visible ahora es "Instalar APK".
         self.btn_scan = ttk.Button(
             header,
             text="🔄 Forzar Escaneo Completo",
             command=self.trigger_scan
+        )  # (no se empaqueta: no visible)
+
+        self.btn_apk = ttk.Button(
+            header,
+            text="📦 Instalar APK",
+            command=self.open_apk_installer
         )
-        self.btn_scan.pack(side=tk.RIGHT, padx=5)
+        self.btn_apk.pack(side=tk.RIGHT, padx=5)
 
         # Subtítulo de red
         sub_frame = ttk.Frame(root, padding=(12, 0, 12, 4))
@@ -5542,6 +5549,651 @@ class RealTimeMultiADBApp:
         if row_info and row_info.get("dev"):
             return row_info["dev"]
         return fallback_dev
+
+    # ==========================================================================
+    # INSTALADOR MÚLTIPLE DE APK (ventana "Instalar APK")
+    # ==========================================================================
+
+    @staticmethod
+    def _apk_dev_state(dev):
+        """Devuelve 'connected', 'available' o None según el estado mostrado en la lista principal."""
+        if dev.get("is_local_or_router"):
+            return None
+        if dev.get("is_usb"):
+            if dev.get("is_adb_connected") and not dev.get("is_offline") and not dev.get("is_unauthorized"):
+                return "connected"
+            return None
+        if dev.get("is_adb_connected"):
+            return "connected"
+        if dev.get("is_port_open") and dev.get("is_on_current_net", True):
+            return "available"
+        return None
+
+    @staticmethod
+    def _read_apk_package_name(apk_path):
+        """Extrae el nombre de paquete (package) leyendo AndroidManifest.xml binario dentro del APK (sin aapt)."""
+        import zipfile
+        try:
+            with zipfile.ZipFile(apk_path, "r") as zf:
+                data = zf.read("AndroidManifest.xml")
+            if len(data) < 16:
+                return ""
+            pos = 8
+            strings = []
+            while pos + 8 <= len(data):
+                ctype, _hsz, csz = struct.unpack_from("<HHI", data, pos)
+                if csz <= 0 or pos + csz > len(data):
+                    break
+                if ctype == 0x0001:  # RES_STRING_POOL_TYPE
+                    scnt, _stcnt, flags, soff, _ = struct.unpack_from("<IIIII", data, pos + 8)
+                    is_utf8 = bool(flags & (1 << 8))
+                    offsets = struct.unpack_from(f"<{scnt}I", data, pos + 28)
+                    base = pos + soff
+                    for o in offsets:
+                        p = base + o
+                        if p >= len(data):
+                            strings.append("")
+                            continue
+                        if is_utf8:
+                            v = data[p]
+                            p += 2 if (v & 0x80) else 1
+                            b = data[p]
+                            if b & 0x80:
+                                blen = ((b & 0x7F) << 8) | data[p + 1]
+                                p += 2
+                            else:
+                                blen = b
+                                p += 1
+                            strings.append(data[p:p + blen].decode("utf-8", errors="replace"))
+                        else:
+                            v = struct.unpack_from("<H", data, p)[0]
+                            if v & 0x8000:
+                                v = ((v & 0x7FFF) << 16) | struct.unpack_from("<H", data, p + 2)[0]
+                                p += 4
+                            else:
+                                p += 2
+                            strings.append(data[p:p + v * 2].decode("utf-16le", errors="replace"))
+                elif ctype == 0x0102:  # RES_XML_START_ELEMENT_TYPE
+                    name_idx = struct.unpack_from("<I", data, pos + 20)[0]
+                    attr_start, attr_sz, attr_cnt = struct.unpack_from("<HHH", data, pos + 24)
+                    if 0 <= name_idx < len(strings) and strings[name_idx] == "manifest":
+                        apos = pos + 16 + attr_start
+                        for _ in range(attr_cnt):
+                            if apos + 20 > pos + csz:
+                                break
+                            _ns, aname_idx, rval_idx, _tsz, _r0, _dtype, _dval = struct.unpack_from("<IIIHBBI", data, apos)
+                            aname = strings[aname_idx] if 0 <= aname_idx < len(strings) else ""
+                            if aname == "package" and 0 <= rval_idx < len(strings):
+                                return strings[rval_idx].strip()
+                            apos += attr_sz
+                        break
+                pos += csz
+        except Exception:
+            pass
+        return ""
+
+    def open_apk_installer(self):
+        win = getattr(self, "_apk_win", None)
+        try:
+            if win is not None and win.winfo_exists():
+                win.deiconify()
+                win.lift()
+                win.focus_force()
+                return
+        except Exception:
+            pass
+
+        win = tk.Toplevel(self.root)
+        self._apk_win = win
+        win.title("📦 Instalar APK en múltiples dispositivos")
+        win.geometry("1040x680")
+        win.minsize(820, 560)
+        # Ventana independiente con botones nativos de minimizar, maximizar y cerrar
+        win.resizable(True, True)
+        try:
+            win.attributes("-toolwindow", False)
+        except Exception:
+            pass
+
+        apk_paths = []          # rutas de APK montadas
+        checked = set()         # claves de dispositivos marcados
+        row_status = {}         # clave -> texto de resultado de instalación
+        shown = {"keys": [], "sig": None}
+        state = {"installing": False, "after": None}
+        auto_replace_var = tk.BooleanVar(value=True)
+
+        main = ttk.Frame(win, padding=10)
+        main.pack(fill=tk.BOTH, expand=True)
+
+        # ---- Sección APKs ----
+        apk_box = ttk.LabelFrame(main, text=" 1. APK(s) a instalar ", padding=8)
+        apk_box.pack(fill=tk.X)
+
+        apk_list_f = ttk.Frame(apk_box)
+        apk_list_f.pack(fill=tk.X)
+        apk_tree = ttk.Treeview(apk_list_f, columns=("nombre", "tam", "ruta"), show="headings", height=4, selectmode="extended")
+        apk_tree.heading("nombre", text="Archivo")
+        apk_tree.heading("tam", text="Tamaño")
+        apk_tree.heading("ruta", text="Ruta")
+        apk_tree.column("nombre", width=240, anchor=tk.W)
+        apk_tree.column("tam", width=80, anchor=tk.E)
+        apk_tree.column("ruta", width=520, anchor=tk.W)
+        apk_sb = ttk.Scrollbar(apk_list_f, orient=tk.VERTICAL, command=apk_tree.yview)
+        apk_tree.configure(yscrollcommand=apk_sb.set)
+        apk_tree.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        apk_sb.pack(side=tk.LEFT, fill=tk.Y)
+
+        def _fmt_size(n):
+            if n < 1024 * 1024:
+                return f"{n / 1024.0:.0f} KB"
+            return f"{n / (1024.0 * 1024.0):.1f} MB"
+
+        def add_apks():
+            files = filedialog.askopenfilenames(
+                parent=win, title="Seleccionar APK(s)",
+                filetypes=[("Paquetes Android", "*.apk"), ("Todos los archivos", "*.*")]
+            )
+            for f in files:
+                p = os.path.normpath(f)
+                if p in apk_paths or not os.path.isfile(p):
+                    continue
+                apk_paths.append(p)
+                try:
+                    sz = _fmt_size(os.path.getsize(p))
+                except Exception:
+                    sz = "-"
+                apk_tree.insert("", tk.END, iid=p, values=(os.path.basename(p), sz, p))
+            _refresh_install_btn()
+
+        def remove_apks():
+            for iid in apk_tree.selection():
+                if iid in apk_paths:
+                    apk_paths.remove(iid)
+                apk_tree.delete(iid)
+            _refresh_install_btn()
+
+        def clear_apks():
+            for iid in list(apk_paths):
+                try:
+                    apk_tree.delete(iid)
+                except Exception:
+                    pass
+            apk_paths.clear()
+            _refresh_install_btn()
+
+        apk_btns = ttk.Frame(apk_box)
+        apk_btns.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(apk_btns, text="➕ Adjuntar APK(s)...", command=add_apks).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(apk_btns, text="➖ Quitar seleccionado(s)", command=remove_apks).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(apk_btns, text="🗑 Limpiar lista", command=clear_apks).pack(side=tk.LEFT, padx=(0, 12))
+        ttk.Checkbutton(
+            apk_btns,
+            text="Reemplazar automáticamente si hay conflicto de firma o versión anterior",
+            variable=auto_replace_var
+        ).pack(side=tk.RIGHT)
+
+        # ---- Sección dispositivos ----
+        dev_box = ttk.LabelFrame(main, text=" 2. Dispositivos (se actualiza en tiempo real) ", padding=8)
+        dev_box.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+
+        dev_f = ttk.Frame(dev_box)
+        dev_f.pack(fill=tk.BOTH, expand=True)
+        cols = ("sel", "nombre", "ip", "estado", "resultado")
+        dev_tree = ttk.Treeview(dev_f, columns=cols, show="headings", selectmode="none")
+        dev_tree.heading("sel", text="Sel.")
+        dev_tree.heading("nombre", text="Dispositivo")
+        dev_tree.heading("ip", text="Dirección IP")
+        dev_tree.heading("estado", text="Estado / Conexión")
+        dev_tree.heading("resultado", text="Resultado de instalación")
+        dev_tree.column("sel", width=44, minwidth=44, anchor=tk.CENTER, stretch=False)
+        dev_tree.column("nombre", width=190, minwidth=130, anchor=tk.W, stretch=False)
+        dev_tree.column("ip", width=155, minwidth=120, anchor=tk.W, stretch=False)
+        dev_tree.column("estado", width=165, minwidth=135, anchor=tk.W, stretch=False)
+        dev_tree.column("resultado", width=430, minwidth=260, anchor=tk.W, stretch=True)
+        dev_tree.tag_configure("connected", foreground="#1e7a34")
+        dev_tree.tag_configure("available", foreground="#0066cc")
+        dev_tree.tag_configure("ok", foreground="#1e7a34")
+        dev_tree.tag_configure("err", foreground="#cc2222")
+        dev_sb = ttk.Scrollbar(dev_f, orient=tk.VERTICAL, command=dev_tree.yview)
+        dev_hsb = ttk.Scrollbar(dev_f, orient=tk.HORIZONTAL, command=dev_tree.xview)
+        dev_tree.configure(yscrollcommand=dev_sb.set, xscrollcommand=dev_hsb.set)
+        dev_tree.grid(row=0, column=0, sticky="nsew")
+        dev_sb.grid(row=0, column=1, sticky="ns")
+        dev_hsb.grid(row=1, column=0, sticky="ew")
+        dev_f.grid_rowconfigure(0, weight=1)
+        dev_f.grid_columnconfigure(0, weight=1)
+
+        lbl_info = ttk.Label(dev_box, text="", font=("Segoe UI", 9), foreground="#555555")
+        lbl_info.pack(anchor=tk.W, pady=(6, 0))
+
+        def toggle_row(event):
+            if state["installing"]:
+                return
+            if dev_tree.identify_region(event.x, event.y) != "cell":
+                return
+            iid = dev_tree.identify_row(event.y)
+            if not iid or iid not in shown["keys"]:
+                return
+            if iid in checked:
+                checked.discard(iid)
+            else:
+                checked.add(iid)
+            _redraw_row(iid)
+            _refresh_install_btn()
+
+        dev_tree.bind("<Button-1>", toggle_row)
+
+        def _current_devices():
+            out = []
+            for k, info in list(self.device_rows.items()):
+                d = info.get("dev")
+                if not d:
+                    continue
+                st = self._apk_dev_state(d)
+                if st:
+                    out.append((k, d, st))
+            out.sort(key=lambda t: get_device_sort_key(t[1]))
+            return out
+
+        def _row_values(k, d, st):
+            if st == "connected":
+                if d.get("is_usb"):
+                    est = "● Conectado (USB)"
+                else:
+                    est = f"● Conectado ADB ({d.get('port', '5555')})"
+            else:
+                est = "● ADB disponible"
+            ip = d.get("ip", "")
+            return ("☑" if k in checked else "☐", d.get("name", "Dispositivo"), ip, est, row_status.get(k, ""))
+
+        def _row_tags(k, d, st):
+            res = row_status.get(k, "")
+            if res.startswith("✔"):
+                return (st, "ok")
+            if res.startswith("✖"):
+                return (st, "err")
+            return (st,)
+
+        def _redraw_row(k):
+            info = self.device_rows.get(k)
+            if not info or not info.get("dev"):
+                return
+            d = info["dev"]
+            st = self._apk_dev_state(d)
+            if not st:
+                return
+            try:
+                dev_tree.item(k, values=_row_values(k, d, st), tags=_row_tags(k, d, st))
+            except Exception:
+                pass
+
+        def refresh_devices():
+            """Sincroniza la lista con el estado actual de la ventana principal."""
+            devs = _current_devices()
+            keys = [k for k, _, _ in devs]
+            sig = tuple((k, st, d.get("name"), d.get("port"), d.get("ip")) for k, d, st in devs)
+            # descartar marcados que ya no estén listados
+            for k in list(checked):
+                if k not in keys:
+                    checked.discard(k)
+            if sig != shown["sig"] or keys != shown["keys"]:
+                existing = set(dev_tree.get_children())
+                for k in existing - set(keys):
+                    dev_tree.delete(k)
+                for idx, (k, d, st) in enumerate(devs):
+                    vals = _row_values(k, d, st)
+                    if k in existing:
+                        dev_tree.item(k, values=vals, tags=_row_tags(k, d, st))
+                    else:
+                        dev_tree.insert("", tk.END, iid=k, values=vals, tags=_row_tags(k, d, st))
+                    dev_tree.move(k, "", idx)
+                shown["keys"] = keys
+                shown["sig"] = sig
+            n_conn = sum(1 for _, _, st in devs if st == "connected")
+            n_av = sum(1 for _, _, st in devs if st == "available")
+            lbl_info.config(text=f"{n_conn} conectado(s)  |  {n_av} con ADB disponible  |  {len(checked)} seleccionado(s)")
+            _refresh_install_btn()
+
+        def _poll():
+            try:
+                if not win.winfo_exists():
+                    return
+            except Exception:
+                return
+            try:
+                refresh_devices()
+            except Exception:
+                pass
+            state["after"] = win.after(1200, _poll)
+
+        def select_all_connected():
+            if state["installing"]:
+                return
+            for k, d, st in _current_devices():
+                if st == "connected":
+                    checked.add(k)
+            refresh_devices()
+            for k in shown["keys"]:
+                _redraw_row(k)
+
+        def select_none():
+            if state["installing"]:
+                return
+            checked.clear()
+            for k in shown["keys"]:
+                _redraw_row(k)
+            refresh_devices()
+
+        sel_bar = ttk.Frame(dev_box)
+        sel_bar.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(sel_bar, text="Seleccionar conectados", command=select_all_connected).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(sel_bar, text="Deseleccionar todos", command=select_none).pack(side=tk.LEFT)
+
+        # ---- Barra inferior ----
+        bottom = ttk.Frame(main)
+        bottom.pack(fill=tk.X, pady=(10, 0))
+        lbl_prog = ttk.Label(bottom, text="", font=("Segoe UI", 9, "bold"))
+        lbl_prog.pack(side=tk.LEFT)
+        btn_close = ttk.Button(bottom, text="Cerrar", command=lambda: _on_close())
+        btn_close.pack(side=tk.RIGHT, padx=(6, 0))
+        btn_install = ttk.Button(bottom, text="⬇ Instalar", command=lambda: start_install())
+        btn_install.pack(side=tk.RIGHT)
+
+        def _refresh_install_btn():
+            ok = bool(apk_paths) and bool(checked) and not state["installing"]
+            try:
+                btn_install.config(state=tk.NORMAL if ok else tk.DISABLED)
+            except Exception:
+                pass
+
+        def _set_result(k, text):
+            row_status[k] = text
+            def _apply():
+                try:
+                    if win.winfo_exists():
+                        _redraw_row(k)
+                except Exception:
+                    pass
+            self.post_gui(_apply)
+
+        cflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
+        def _run_install_cmd(target, args, on_wait=None, timeout=900):
+            """Ejecuta 'adb install' y, si queda esperando, detecta avisos en pantalla del dispositivo
+            (Play Protect / instalador) para informarlo en la lista en lugar de parecer congelado."""
+            proc = subprocess.Popen(["adb", "-s", str(target)] + args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True, errors="replace", creationflags=cflags)
+            t0 = time.time()
+            last_probe = 0.0
+            prompted = False
+            while True:
+                try:
+                    out, err = proc.communicate(timeout=1.0)
+                    return (out or "") + "\n" + (err or "")
+                except subprocess.TimeoutExpired:
+                    pass
+                now = time.time()
+                if now - t0 > timeout:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    raise subprocess.TimeoutExpired(args, timeout)
+                if on_wait and now - t0 > 8 and now - last_probe > 4:
+                    last_probe = now
+                    try:
+                        f = subprocess.run(["adb", "-s", str(target), "shell", "dumpsys window | grep mCurrentFocus"],
+                                           capture_output=True, text=True, errors="replace",
+                                           creationflags=cflags, timeout=6).stdout.lower()
+                    except Exception:
+                        f = ""
+                    waiting = any(w in f for w in ("protectdialogs", "packageinstaller", "installappprogress", "installstart"))
+                    if waiting and not prompted:
+                        prompted = True
+                        on_wait("⏳ Esperando que aceptes el aviso en la pantalla del dispositivo (Play Protect/instalador)...")
+                    elif not waiting and prompted:
+                        prompted = False
+                        on_wait(None)
+
+        def _uninstall_pkg(target, pkg):
+            """Desinstala un paquete existente antes de reinstalar cuando la firma o versión entra en conflicto."""
+            if not pkg:
+                return False
+            try:
+                r = subprocess.run(["adb", "-s", str(target), "uninstall", pkg], capture_output=True, text=True,
+                                   errors="replace", creationflags=cflags, timeout=45)
+                out = ((r.stdout or "") + " " + (r.stderr or "")).lower()
+                if "success" in out:
+                    return True
+            except Exception:
+                pass
+            try:
+                r2 = subprocess.run(["adb", "-s", str(target), "shell", "pm", "uninstall", "--user", "0", pkg],
+                                    capture_output=True, text=True, errors="replace", creationflags=cflags, timeout=30)
+                if "success" in ((r2.stdout or "") + " " + (r2.stderr or "")).lower():
+                    return True
+            except Exception:
+                pass
+            return False
+
+        def _extract_pkg_from_error(err_text, apk):
+            # Ej: "Package com.kubilabs.ontheflypos signatures do not match..." / "Existing package com.foo ..."
+            m = re.search(r"(?:Package|package)\s+([a-zA-Z0-9_]+(?:\.[a-zA-Z0-9_]+)+)", err_text or "")
+            if m:
+                return m.group(1).strip()
+            return self._read_apk_package_name(apk)
+
+        def _install_one_apk(target, apk, on_wait=None, allow_replace=True):
+            """Instala o actualiza un APK. Si Android rechaza por firma distinta o versión anterior
+            y allow_replace está activo, desinstala la versión en conflicto y la instala limpia.
+            Devuelve (ok, mensaje)."""
+            def _try_attempts(extra_flags=()):
+                flag_sets = [
+                    ["install", "-r", "-t", "-g", *extra_flags, apk],
+                    ["install", "-r", "-t", *extra_flags, apk],
+                    ["install", "-r", *extra_flags, apk],
+                ]
+                last_out = ""
+                for idx_a, args in enumerate(flag_sets):
+                    try:
+                        out = _run_install_cmd(target, args, on_wait=on_wait).strip()
+                    except subprocess.TimeoutExpired:
+                        return False, "__TIMEOUT__"
+                    except Exception as ex:
+                        return False, str(ex)
+                    low = out.lower()
+                    if "success" in low and "failure" not in low:
+                        return True, "OK"
+                    last_out = out
+                    if idx_a < len(flag_sets) - 1 and (
+                        "unknown option" in low or "invalid option" in low
+                        or "usage: pm install" in low or "usage: adb install" in low
+                        or ("-g" in low and "not" in low) or ("-t" in low and "not" in low)
+                    ):
+                        continue
+                    break
+                return False, last_out
+
+            ok, last = _try_attempts()
+            if ok:
+                return True, "OK"
+            if last == "__TIMEOUT__":
+                return False, "Tiempo de espera agotado (¿aviso sin aceptar en el dispositivo?)"
+
+            low_last = (last or "").lower()
+            # 1. Si es downgrade de versión, intentar primero con -d (conserva datos si es debuggable)
+            if "install_failed_version_downgrade" in low_last:
+                ok_d, last_d = _try_attempts(extra_flags=("-d",))
+                if ok_d:
+                    return True, "OK (downgrade)"
+                if last_d != "__TIMEOUT__":
+                    last = last_d
+                    low_last = (last or "").lower()
+
+            # 2. Si persiste conflicto de firma (INSTALL_FAILED_UPDATE_INCOMPATIBLE) o downgrade bloqueado:
+            #    desinstalar el paquete en conflicto y volver a instalar limpiamente.
+            is_sig_conflict = "install_failed_update_incompatible" in low_last or "signatures do not match" in low_last
+            is_downgrade_conflict = "install_failed_version_downgrade" in low_last
+            if allow_replace and (is_sig_conflict or is_downgrade_conflict):
+                pkg = _extract_pkg_from_error(last, apk)
+                if pkg:
+                    reason = "firma distinta" if is_sig_conflict else "versión anterior"
+                    if on_wait:
+                        on_wait(f"⏳ Conflicto ({reason}): reemplazando {pkg}...")
+                    if _uninstall_pkg(target, pkg):
+                        if on_wait:
+                            on_wait(f"⏳ Reinstalando {os.path.basename(apk)}...")
+                        ok_r, last_r = _try_attempts()
+                        if ok_r:
+                            return True, f"reemplazada por {reason}"
+                        if last_r == "__TIMEOUT__":
+                            return False, "Tiempo de espera agotado al reinstalar"
+                        last = last_r
+
+            m = re.search(r"(INSTALL_[A-Z0-9_]+)", last or "")
+            if m:
+                code = m.group(1)
+                hints = {
+                    "INSTALL_FAILED_VERSION_DOWNGRADE": "versión instalada es más nueva",
+                    "INSTALL_FAILED_UPDATE_INCOMPATIBLE": "firma distinta a la instalada",
+                    "INSTALL_FAILED_INSUFFICIENT_STORAGE": "sin espacio",
+                    "INSTALL_FAILED_OLDER_SDK": "Android demasiado antiguo",
+                    "INSTALL_FAILED_USER_RESTRICTED": "instalación bloqueada por el dispositivo",
+                    "INSTALL_FAILED_TEST_ONLY": "APK solo para pruebas",
+                    "INSTALL_PARSE_FAILED_NO_CERTIFICATES": "APK sin firmar",
+                }
+                for hk, hv in hints.items():
+                    if hk in code:
+                        return False, f"{code} ({hv})"
+                return False, code
+            return False, (last.splitlines()[-1] if last else "Error desconocido")[:160]
+
+        def _install_on_device(k, d, st, apks, allow_replace=True):
+            name = d.get("name", "Dispositivo")
+            try:
+                if st == "available" or not d.get("is_adb_connected"):
+                    _set_result(k, "⏳ Conectando ADB...")
+                    ok, detail, model = connect_ip_automatically(d.get("ip", ""), known_port=d.get("port", ""))
+                    if not ok:
+                        _set_result(k, f"✖ No se pudo conectar: {str(detail).splitlines()[0][:100]}")
+                        return False
+                    d["is_adb_connected"] = True
+                    d["serial"] = detail
+                    self.post_gui(self._update_row_state_by_key, k, d)
+                    target = resolve_active_adb_target(detail, dev=d) or detail
+                else:
+                    base = d.get("serial") or d.get("ip", "")
+                    target = resolve_active_adb_target(base, dev=d) or base
+                done = 0
+                replaced_any = False
+                for apk in apks:
+                    base_msg = f"⏳ Instalando {os.path.basename(apk)} ({done + 1}/{len(apks)})..."
+                    _set_result(k, base_msg)
+
+                    def _on_wait(msg, _k=k, _b=base_msg):
+                        _set_result(_k, msg if msg else _b)
+
+                    ok, msg = _install_one_apk(target, apk, on_wait=_on_wait, allow_replace=allow_replace)
+                    if not ok and ("not found" in msg.lower() or "offline" in msg.lower()) and not d.get("is_usb") and d.get("ip"):
+                        ok2, detail2, _m = connect_ip_automatically(d.get("ip", ""), known_port=d.get("port", ""))
+                        if ok2:
+                            target = resolve_active_adb_target(detail2, dev=d) or detail2
+                            ok, msg = _install_one_apk(target, apk, on_wait=_on_wait, allow_replace=allow_replace)
+                    if not ok:
+                        _set_result(k, f"✖ {os.path.basename(apk)}: {msg}")
+                        return False
+                    if "reemplazada" in str(msg).lower():
+                        replaced_any = True
+                    done += 1
+                suffix = " (reemplazada por firma/versión)" if replaced_any else ""
+                _set_result(k, f"✔ {done} APK(s) instalada(s)/actualizada(s){suffix}")
+                return True
+            except Exception as ex:
+                _set_result(k, f"✖ Error: {str(ex)[:120]}")
+                return False
+
+        def start_install():
+            if state["installing"] or not apk_paths or not checked:
+                return
+            targets = []
+            for k, d, st in _current_devices():
+                if k in checked:
+                    targets.append((k, d, st))
+            if not targets:
+                messagebox.showinfo("Instalar APK", "Selecciona al menos un dispositivo conectado.", parent=win)
+                return
+            # Un mismo equipo físico puede aparecer por USB y por Wi-Fi: se instala una sola vez (vía USB)
+            usb_wlan = {d.get("wlan_ip"): k for k, d, st in targets if d.get("is_usb") and d.get("wlan_ip")}
+            mirror = {}
+            unique_targets = []
+            for k, d, st in targets:
+                if not d.get("is_usb") and d.get("ip") in usb_wlan:
+                    mirror[k] = usb_wlan[d.get("ip")]
+                else:
+                    unique_targets.append((k, d, st))
+            targets_all = targets
+            targets = unique_targets
+            apks = list(apk_paths)
+            allow_replace = bool(auto_replace_var.get())
+            state["installing"] = True
+            btn_install.config(state=tk.DISABLED)
+            for k, _, _ in targets_all:
+                _set_result(k, "⏳ En cola...")
+            total = len(targets)
+            lbl_prog.config(text=f"Instalando en {total} dispositivo(s) simultáneamente...")
+
+            def _run():
+                results = {}
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, total)) as ex:
+                    futs = {ex.submit(_install_on_device, k, d, st, apks, allow_replace): k for k, d, st in targets}
+                    for fut in concurrent.futures.as_completed(futs):
+                        k = futs[fut]
+                        try:
+                            results[k] = bool(fut.result())
+                        except Exception:
+                            results[k] = False
+                        for mk, src in mirror.items():
+                            if src == k:
+                                _set_result(mk, "↺ Mismo equipo (USB): " + row_status.get(k, "").lstrip("✔✖⏳ ").strip())
+                        ok_n = sum(1 for v in results.values() if v)
+                        try:
+                            self.post_gui(lambda o=ok_n, n=len(results): lbl_prog.config(
+                                text=f"Progreso: {n}/{total} terminados ({o} correctos)"))
+                        except Exception:
+                            pass
+
+                def _finish():
+                    state["installing"] = False
+                    ok_n = sum(1 for v in results.values() if v)
+                    try:
+                        if win.winfo_exists():
+                            lbl_prog.config(text=f"✔ Finalizado: {ok_n} correcto(s), {total - ok_n} con error")
+                            _refresh_install_btn()
+                    except Exception:
+                        pass
+                    self.set_status(f"Instalación de APK finalizada: {ok_n}/{total} dispositivos correctos.")
+
+                self.post_gui(_finish)
+
+            threading.Thread(target=_run, daemon=True).start()
+
+        def _on_close():
+            if state["installing"]:
+                if not messagebox.askyesno("Instalación en curso",
+                                           "Hay una instalación en curso. Si cierras la ventana seguirá ejecutándose en segundo plano.\n\n¿Cerrar de todos modos?",
+                                           parent=win):
+                    return
+            try:
+                if state["after"]:
+                    win.after_cancel(state["after"])
+            except Exception:
+                pass
+            self._apk_win = None
+            win.destroy()
+
+        win.protocol("WM_DELETE_WINDOW", _on_close)
+        _refresh_install_btn()
+        _poll()
 
     def _refresh_mic_apk_button(self, btn_mic, dev, dev_key):
         if not btn_mic:
